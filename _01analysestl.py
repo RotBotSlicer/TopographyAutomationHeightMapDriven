@@ -1,103 +1,143 @@
-from stl import mesh
-from mpl_toolkits import mplot3d
-from matplotlib import pyplot
+# _01analysestl.py — Clean Version (Automatic Cuts + Overhang Detection)
 import numpy as np
-import sys
+from stl import mesh
 
-# Defaults
-file_stl = "test.stl"
-file_cuts = "cuts.txt"
 
-def analyseSTL(in_stl, out_cuts, cutoffangle = 45, mincutheight = 5, debug = False):
+# --------------------------------------------------------------------
+#  NORMAL UTILITIES
+# --------------------------------------------------------------------
+
+def _triangle_normals(vectors):
     """
-    Decide the cutting heights for a given stl file
-    Faces steeper than the cuttoffangle are grouped together in z-direction if continuous. 
-    :param in_stl: string
-        path to the stl file
-    :param out_cut: string
-        path of a txt files where the different cutting heights will be stored separated by newlines
-    :param cutoffangle: degree
-        Faces steeper than cutoffangle are grouped together and marked to be cut out
-    :param mincutheight: mm
-        Minimal height of resulting heights of slices
-    :param debug: bool
-        Show debug information
-    :return: 
+    Compute normal directions for each triangle in an Nx3x3 array.
     """
-    # Get face angles
-    body = mesh.Mesh.from_file(in_stl)
-    normals = body.get_unit_normals()
-    normals_z = normals[:,2]
-    angle = np.arccos(normals_z)
+    v1 = vectors[:, 1, :] - vectors[:, 0, :]
+    v2 = vectors[:, 2, :] - vectors[:, 0, :]
+    normals = np.cross(v1, v2)
 
-    # Get all faces steeper than cutoffangle and sort them in z-direction
-    zmin = [min(face[:,2]) for face in body.vectors]
-    zmax = [max(face[:,2]) for face in body.vectors]
-    cutoffangle = cutoffangle / 180 * np.pi + np.pi/2
-    interval = [[min, max, a] for (min, max, a) in zip(zmin, zmax, angle) if a > cutoffangle]
-    interval.sort(key=lambda x: x[0])
-    if(debug): print("Sorted intervals of faces steeper than ", cutoffangle, "°:\n", interval)
+    # Normalize safely
+    lengths = np.linalg.norm(normals, axis=1)
+    lengths[lengths == 0] = 1e-12
+    normals /= lengths[:, None]
 
-    # Group continuous intervals together
-    index = 0
-    for i in range(1, len(interval)):
-        if (interval[index][1] >= interval[i][0]):
-            interval[index][1] = max(interval[index][1], interval[i][1])
-        else:
-            index = index + 1
-            interval[index] = interval[i]
-    interval = interval[0:index+1]
-    if(debug): print("Continuous intervals:\n", interval)
-
-    # Calculate cutheights according to intervals and mincutheight
-    minheight = min(zmin)
-    maxheight = max(zmax)
-    cutheights = []
-    cutheights.append(minheight)
-    if interval[0][1]-interval[0][0] > 0.2:
-        cutheights.append(max(interval[0][1], interval[0][0]+mincutheight))
-    interval.append([maxheight, maxheight])
-    for i in range(1, len(interval)-1):
-        if(cutheights[-1] >= interval[i][0]):
-            cutheights[-1] = interval[i][0]
-        else:
-            cutheights.append(interval[i][0])
-        cutheights.append(max(interval[i][1], interval[i][0] + mincutheight))
-    if(cutheights[-1] > maxheight):
-        del cutheights[-1]
-    if(debug): print("cutheights:\n", cutheights)
-
-    # Save cuts in file
-    with open(out_cuts, "w") as f_cuts:
-        for cut in cutheights:
-            f_cuts.write(str(cut) + "\n")#" ".join(cut) + "\n")
+    return normals
 
 
-    if(debug):
-        # Create a new plot
-        figure = pyplot.figure()
-        axes = mplot3d.Axes3D(figure)
+# --------------------------------------------------------------------
+#  AUTOMATIC CUT HEIGHTS
+# --------------------------------------------------------------------
 
-        # Load the STL files and add the vectors to the plot
-        col = mplot3d.art3d.Poly3DCollection(body.vectors)
-        color = [(1,0,0) if a > cutoffangle else (0,0,1) for a in angle]
-        col.set_facecolor(color)
-        axes.add_collection3d(col)
+def compute_cut_heights(stl_path, dz_min=6.0):
+    """
+    Automatically compute vertical cut heights.
 
-        # Auto scale to the mesh size
-        scale = body.points.flatten()
-        axes.auto_scale_xyz(scale, scale, scale)
+    Parameters
+    ----------
+    stl_path : str
+        Path to the input STL.
+    dz_min : float
+        Minimal height difference allowed between cuts.
+        Prevents too many unnecessary small cuts.
 
-        # Show the plot to the screen
-        pyplot.show()
+    Returns
+    -------
+    list of floats
+        Sorted Z-values at which to cut the STL.
+        Always includes z=0.
+    """
+    body = mesh.Mesh.from_file(stl_path)
+    verts = body.vectors.reshape(-1, 3)
 
-if __name__ == "__main__":
-    if(len(sys.argv) > 2):
-        file_stl = sys.argv[1]
-        file_cuts = sys.argv[2]
-    if(len(sys.argv) > 5):
-        analyseSTL(in_stl, out_cuts, sys.argv[3], sys.argv[4], True)
-    elif(len(sys.argv) > 4):
-        analyseSTL(in_stl, out_cuts, sys.argv[3], sys.argv[4])
-    else:
-        analyseSTL(in_stl, out_cuts)
+    z_values = verts[:, 2]
+    z_min, z_max = float(np.min(z_values)), float(np.max(z_values))
+
+    # We detect natural changes in silhouette / shape
+    # by checking triangle normal changes vs Z.
+    vectors = body.vectors
+    normals = _triangle_normals(vectors)
+
+    # A triangle is "horizontal-ish" if its normal is almost vertical.
+    # These typically form natural stable layers.
+    vertical_alignment = np.abs(normals[:, 2])  # 1 = vertical normal = horizontal triangle
+    is_flat = vertical_alignment > 0.95  # threshold — tune if needed
+
+    flat_triangle_z = np.mean(vectors[is_flat, :, 2], axis=1) if np.any(is_flat) else []
+
+    # Combine: natural flat regions + min/max
+    raw_cuts = [0.0]   # MUST include zero
+    raw_cuts.extend(flat_triangle_z)
+    raw_cuts.extend([z_min, z_max])
+
+    raw_cuts = sorted(list(set([float(z) for z in raw_cuts])))
+
+    # Reduce cuts: keep only those separated by >= dz_min
+    final_cuts = [raw_cuts[0]]
+    for z in raw_cuts[1:]:
+        if z - final_cuts[-1] >= dz_min:
+            final_cuts.append(z)
+
+    # Ensure last cut is top
+    if final_cuts[-1] != z_max:
+        final_cuts.append(z_max)
+
+    return final_cuts
+
+
+# --------------------------------------------------------------------
+#  WRITE CUTS TO FILE
+# --------------------------------------------------------------------
+
+def analyseSTL(stl_path, cuts_txt_path):
+    """
+    Analyse STL → determine cut heights → write to cuts.txt
+    """
+    print("  [analyseSTL] Loading:", stl_path)
+    cuts = compute_cut_heights(stl_path, dz_min=6.0)
+
+    with open(cuts_txt_path, "w") as f:
+        for z in cuts:
+            f.write(f"{z:.6f}\n")
+
+    print("  [analyseSTL] Computed cut heights:", cuts)
+    print("  [analyseSTL] Saved to:", cuts_txt_path)
+
+
+# --------------------------------------------------------------------
+#  SEGMENT OVERHANG DETECTION
+# --------------------------------------------------------------------
+
+def segment_has_overhang(stl_path, angle_deg=45.0):
+    """
+    Determine if a segmented STL contains ANY downward-facing triangles.
+
+    Overhang rule:
+        If the angle between triangle normal and +Z is > angle_deg,
+        the part is considered “nonplanar” or “needs deformation”.
+
+    Parameters
+    ----------
+    stl_path : str
+        Path to a segment STL (from stl_parts/)
+    angle_deg : float
+        Threshold angle. 45° is a good universal default.
+
+    Returns
+    -------
+    bool
+        True  → this segment should be heightmap-transformed
+        False → this segment can remain planar
+    """
+    body = mesh.Mesh.from_file(stl_path)
+    normals = _triangle_normals(body.vectors)
+
+    # Dot with +Z
+    dot_up = normals[:, 2]
+
+    # Angle between normal and +Z
+    # angle = arccos(dot_up)
+    angle = np.arccos(np.clip(dot_up, -1.0, 1.0)) * 180.0 / np.pi
+
+    # Downward & overhang if angle > angle_deg
+    overhang_mask = angle > angle_deg
+
+    return bool(np.any(overhang_mask))

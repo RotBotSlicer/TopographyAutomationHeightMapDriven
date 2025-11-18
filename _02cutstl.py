@@ -1,215 +1,160 @@
+# _02cutstl.py — Clean, safe interior cutting with top-gap protection
 import os
 import subprocess
+from stl import mesh
 from _10config import get_slic3r_binary, CUT_CONFIG
 
 
+# -----------------------------------------------------------
+#  READ CUT HEIGHTS
+# -----------------------------------------------------------
 def _read_cut_heights(cuts_file):
     """
-    Read cut heights [mm] from cuts.txt.
-
-    Behavior:
-    - Parse each non-empty line as float (comma or dot decimal).
-    - Drop duplicates.
-    - Sort ascending.
-    - Drop heights at or below CUT_CONFIG["ignore_cuts_at_or_below_mm"].
-      (This handles the "0 mm should not force a cut" rule.)
-
-    Returns
-    -------
-    cuts_sorted : list[float]
-        e.g. [21.0, 25.7, 38.0, 46.3, 49.5]
+    Read cut heights from cuts.txt → sorted list of floats.
+    Ignores anything <= ignore_min (usually 0 mm).
     """
     ignore_min = CUT_CONFIG.get("ignore_cuts_at_or_below_mm", 0.0)
 
-    raw_vals = []
+    heights = []
     with open(cuts_file, "r") as f:
         for line in f:
-            line = line.strip()
+            line = line.strip().replace(",", ".")
             if not line:
                 continue
-            # accept "25,7" as "25.7"
-            line = line.replace(",", ".")
             try:
-                z_val = float(line)
+                val = float(line)
             except ValueError:
                 continue
-            # apply ignore threshold
-            if z_val > ignore_min:
-                raw_vals.append(z_val)
+            if val > ignore_min:
+                heights.append(val)
 
-    # unique + sort ascending
-    raw_vals = sorted(set(raw_vals))
-
-    return raw_vals
+    return sorted(set(heights))
 
 
+# -----------------------------------------------------------
+#  MAIN CUT FUNCTION
+# -----------------------------------------------------------
 def cutSTL(in_stl, cuts_file, out_folder):
     """
-    Cut an STL into stacked segments using Slic3r/SuperSlicer `--cut`,
-    following the proven top-down strategy used in the working script.
-
-    CORE IDEA (top-down peeling):
-    --------------------------------
-    1. We start with the *full* part in `in_stl`. This file WILL BE MODIFIED.
-       (Important: upstream, you already copy the original STL into a
-        working folder before calling cutSTL, so it's okay to mutate it.)
-
-    2. We read the global cut heights from `cuts_file`, for example:
-         [0, 21, 25.7, 38.0, 46.3, 49.5]
-       We remove near-zero (0) because that "cut" is meaningless for the bottom.
-       After cleanup we might have:
-         [21, 25.7, 38.0, 46.3, 49.5]
-
-    3. We then iterate these cut heights from TOP to BOTTOM:
-         [49.5, 46.3, 38.0, 25.7, 21.0]
-       For each cut height h:
-         - We run: slic3r --dont-arrange --cut h -o out.stl <current_body.stl>
-         - Slic3r creates:
-             <current_body>.stl_upper.stl  (geometry ABOVE h)
-             <current_body>.stl_lower.stl  (geometry BELOW h)
-         - We IMMEDIATELY save the _upper.stl chunk aside as one final segment.
-         - We REPLACE current_body.stl with _lower.stl.
-           (So for the next, LOWER cut height we are cutting only the bottom remainder.)
-
-       This exactly matches your "good" log:
-       You kept cutting the SAME file, starting from the highest Z.
-
-    4. After we've processed all cut heights,
-       `in_stl` now holds the bottom-most chunk of the object.
-
-    5. We then assemble the final stack in physical order bottom→top:
-         [ bottom_chunk , ...peeled_upper_chunks reversed... ]
-
-       Finally we rename them nicely into `out_folder`:
-         <basename>_1.stl  (bottom segment)
-         <basename>_2.stl
-         ...
-         <basename>_N.stl  (top segment)
-
-    This ordering is important because downstream code assumes:
-      *_1.stl is the first (lowest) thing to be printed = "bottom"
-      *_N.stl is last (highest) = "top"
+    Cut STL into stacked parts using safe interior cuts:
+      • NEVER cut at z_min or z_max
+      • NEVER cut too close to top (min_top_gap_mm)
+      • Use safety offset (cut slightly LOWER inside geometry)
+      • Works for ANY model height or shape
     """
 
-    # Ensure output directory exists
+    print("[cutSTL] Loading STL:", in_stl)
     os.makedirs(out_folder, exist_ok=True)
 
-    # Extract "test" from ".../test.stl"
-    file_name = os.path.basename(in_stl)        # e.g. "test.stl"
-    base_name, ext = os.path.splitext(file_name)
-    if ext.lower() != ".stl":
-        raise ValueError("cutSTL expects an .stl file as input")
+    # --- Load STL for z-min/max detection ---
+    m = mesh.Mesh.from_file(in_stl)
+    verts = m.vectors.reshape(-1, 3)
+    z_min = float(verts[:, 2].min())
+    z_max = float(verts[:, 2].max())
+    height = z_max - z_min
 
-    # --- 1. Read + sanitize cut heights
-    cut_heights = _read_cut_heights(cuts_file)
-    # Example after reading:
-    #   [21.0, 25.7, 38.0, 46.3, 49.5]
+    print(f"  Model height = {height:.3f} mm (z_min={z_min:.3f}, z_max={z_max:.3f})")
 
-    if len(cut_heights) == 0:
-        # No valid cut → only one final part.
-        final_dst = os.path.join(out_folder, f"{base_name}_1.stl")
-        print("No valid cut heights → single segment:", final_dst)
-        # We MOVE the file because downstream expects the part to live in stl_parts/
-        os.replace(in_stl, final_dst)
+    # --- Read cut heights ---
+    raw = _read_cut_heights(cuts_file)
+    print("  Raw cut heights:", raw)
+
+    # ---------------------------------------------------------
+    # RULES FOR INTERIOR CUT SELECTION
+    # ---------------------------------------------------------
+    # 1. Remove z_min
+    # 2. Remove z_max
+    # 3. Remove cuts too close to the top (to avoid thin caps)
+    min_top_gap = CUT_CONFIG.get("min_top_gap_mm", 2.0)
+
+    interior = [
+        z for z in raw
+        if (z > z_min + 1e-6) and (z < (z_max - min_top_gap))
+    ]
+
+    print("  Interior usable cuts:", interior)
+
+    # ---------------------------------------------------------
+    # If no cuts → copy model as single segment
+    # ---------------------------------------------------------
+    base_name = os.path.splitext(os.path.basename(in_stl))[0]
+
+    if not interior:
+        dst = os.path.join(out_folder, f"{base_name}_1.stl")
+        print("  No interior cuts → output single STL:", dst)
+        os.replace(in_stl, dst)
         return
 
-    # --- 2. Process cuts from highest Z to lowest Z
-    # This is *critical* and matches your working behavior:
-    # High cuts peel off thin top caps; after each cut the "_lower" chunk
-    # becomes the new "body" for the next (lower) cut.
-    cuts_desc = sorted(cut_heights, reverse=True)
+    # ---------------------------------------------------------
+    # Cutting configuration
+    # ---------------------------------------------------------
+    safety_offset   = CUT_CONFIG.get("safety_offset_mm", 0.7)
+    safety_min_edge = CUT_CONFIG.get("safety_min_margin_mm", 0.2)
+    slicer          = get_slic3r_binary()
 
-    slic3r_bin = get_slic3r_binary()
+    # Important: process from top → down
+    interior_desc = sorted(interior, reverse=True)
 
-    # We'll collect each peeled TOP chunk in the order we peel them.
-    # So tmp_parts[0] will be the very topmost, tmp_parts[1] the next layer down, ...
     tmp_parts = []
     tmp_counter = 0
 
-    for cut_z in cuts_desc:
-        print(f"Cutting at Z = {cut_z} mm")
+    # ---------------------------------------------------------
+    # PERFORM CUTS
+    # ---------------------------------------------------------
+    for cut_z in interior_desc:
+        # Effective cut is slightly below --> ensures slicing inside the model
+        cut_eff = cut_z - safety_offset
 
-        # Build slic3r command
+        # Clamp to ensure we never cut below z_min
+        if cut_eff < z_min + safety_min_edge:
+            cut_eff = z_min + safety_min_edge
+
+        print(f"  Cutting at nominal {cut_z:.3f} → effective {cut_eff:.3f}")
+
         cmd = [
-            slic3r_bin,
+            slicer,
             "--dont-arrange",
-            "--cut", str(cut_z),
+            "--cut", str(cut_eff),
             "-o", "out.stl",
             in_stl
         ]
-        print("Running:", " ".join(cmd))
-
+        print("    Running:", " ".join(cmd))
         res = subprocess.run(cmd)
+
         if res.returncode != 0:
-            raise RuntimeError(
-                f"Slic3r --cut at Z={cut_z} failed (exit {res.returncode})"
-            )
+            raise RuntimeError(f"Slic3r cut failed at plane {cut_eff:.3f}")
 
-        upper_path = in_stl + "_upper.stl"
-        lower_path = in_stl + "_lower.stl"
+        upper = in_stl + "_upper.stl"
+        lower = in_stl + "_lower.stl"
 
-        # We expect both to exist if the cut plane truly lies inside the mesh.
-        # In practice, on macOS Slic3r tends to generate both for valid cuts.
-        # If one is missing, we throw because that's almost always geometry/logic mismatch.
-        if not os.path.exists(upper_path):
-            raise FileNotFoundError(
-                f"Expected {upper_path} after cutting {in_stl} at Z={cut_z}, "
-                "but it does not exist."
-            )
-        if not os.path.exists(lower_path):
-            raise FileNotFoundError(
-                f"Expected {lower_path} after cutting {in_stl} at Z={cut_z}, "
-                "but it does not exist."
-            )
+        if not os.path.exists(upper):
+            raise FileNotFoundError(f"    ERROR: missing file {upper}")
+        if not os.path.exists(lower):
+            raise FileNotFoundError(f"    ERROR: missing file {lower}")
 
-        # Store the upper chunk immediately in a unique temp filename
-        # inside out_folder, so it won't be overwritten by the next cut.
-        tmp_name = os.path.join(out_folder, f"_tmp_part_{tmp_counter}.stl")
-        os.replace(upper_path, tmp_name)
+        # Move upper chunk to temp list (this is the top fragment)
+        tmp_name = os.path.join(out_folder, f"_tmp_seg_{tmp_counter}.stl")
+        os.replace(upper, tmp_name)
         tmp_parts.append(tmp_name)
         tmp_counter += 1
 
-        # The lower part becomes the new "current body" that we continue cutting.
-        # We overwrite in_stl with the lower geometry.
-        os.replace(lower_path, in_stl)
+        # Continue cutting by replacing current model with lower part
+        os.replace(lower, in_stl)
 
-    # After finishing all cuts, `in_stl` now contains the last/bottom-most chunk.
+    # After all cuts → in_stl = bottom-most chunk
     bottom_chunk = in_stl
 
-    # --- 3. Build ordered list from bottom to top
-    # tmp_parts[0] is the very topmost piece (peeled first, from the largest cut_z),
-    # tmp_parts[-1] is closer to the bottom.
-    #
-    # We want final physical stack: bottom -> ... -> top.
-    #
-    # So final order is:
-    #   [bottom_chunk] + reversed(tmp_parts)
-    ordered_parts = [bottom_chunk] + list(reversed(tmp_parts))
+    # Final ordering: bottom-first → top-last
+    ordered = [bottom_chunk] + list(reversed(tmp_parts))
 
-    print("Final bottom->top segment list:")
-    for idx_debug, pth in enumerate(ordered_parts, start=1):
-        print(f"  Segment {idx_debug}: {pth}")
+    print("  Final ordered parts:")
+    for i, part in enumerate(ordered, 1):
+        print(f"    Part {i}: {part}")
 
-    # --- 4. Rename into <base_name>_1.stl, _2.stl, ..., in out_folder
-    for idx, src_path in enumerate(ordered_parts, start=1):
-        dst_path = os.path.join(out_folder, f"{base_name}_{idx}.stl")
-        print(f"Saving segment {idx} -> {dst_path}")
-        os.replace(src_path, dst_path)
+    # Rename final segments
+    for i, src in enumerate(ordered, 1):
+        dst = os.path.join(out_folder, f"{base_name}_{i}.stl")
+        os.replace(src, dst)
+        print(f"    → Saved: {dst}")
 
-    print("Done cutting. Segments written to:", out_folder)
-
-
-if __name__ == "__main__":
-    import sys
-
-    # Simple CLI fallback for manual testing:
-    # python _02cutstl.py input.stl cuts.txt out_folder
-    if len(sys.argv) != 4:
-        print("Usage: python _02cutstl.py <input.stl> <cuts.txt> <out_folder>")
-        sys.exit(1)
-
-    in_stl_arg = sys.argv[1]
-    cuts_arg   = sys.argv[2]
-    out_dir    = sys.argv[3]
-
-    cutSTL(in_stl_arg, cuts_arg, out_dir)
+    print("[cutSTL] Finished.\n")

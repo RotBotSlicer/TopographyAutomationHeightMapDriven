@@ -1,10 +1,11 @@
-# _00all.py
+# _00all.py  — Clean, audited pipeline (heightmap nonplanar, planar base)
+
 import sys
 import os
 import time
 import shutil
 
-from _01analysestl import analyseSTL
+from _01analysestl import analyseSTL, segment_has_overhang
 from _02cutstl import cutSTL
 from _03refinemesh import refineMesh
 from _04transformstl import transformSTL
@@ -19,153 +20,212 @@ from _10config import (
     PIPELINE_CONFIG,
 )
 
-# default entry if user doesn't pass an STL
-in_file = "test.stl"
+# Default STL if none given
+DEFAULT_INPUT = "test.stl"
 
 
-def sliceTransform(folder, filename, bottom=False, top=False):
+# --------------------------------------------------------------------------
+#  UTILS
+# --------------------------------------------------------------------------
+def purge_heightmaps():
     """
-    Process a single STL part file:
-    - create a coarse copy for slowdown detection
-    - refine mesh
-    - apply transform if tf_surface exists
-    - slice with SuperSlicer
-    - backtransform/slowdown G-code if nonplanar OR if config says so
+    Delete the entire 'heightmaps/' folder before a new run.
+    Ensures no stale files conflict when the input model changes.
+    """
+    heightmap_dir = "heightmaps"
+    if os.path.isdir(heightmap_dir):
+        print("[PIPELINE] Purging old heightmaps/ folder...")
+        shutil.rmtree(heightmap_dir)
+    os.makedirs(heightmap_dir, exist_ok=True)
+    print("[PIPELINE] Fresh heightmaps/ ready.")
+    
+def _clear_folder(path):
+    """
+    Remove all files in a folder.
+    Used to avoid mixing old and new runs inside the same base folder.
+    """
+    if not os.path.isdir(path):
+        return
+    for name in os.listdir(path):
+        full = os.path.join(path, name)
+        if os.path.isfile(full):
+            os.remove(full)
+
+
+def createFoldersIfMissing(folder_dict: dict):
+    """
+    Ensure all working directories exist.
+    """
+    for path in folder_dict.values():
+        os.makedirs(path, exist_ok=True)
+
+
+# --------------------------------------------------------------------------
+#  HEIGHTMAP BACKTRANSFORM WRAPPER
+# --------------------------------------------------------------------------
+
+def _backtransform_and_slowdown(
+    gcode_in: str,
+    coarse_stl_original: str,
+    out_dir: str,
+) -> str:
+    """
+    Wrapper around transformGCode() so all numeric knobs live in one place.
+
+    - gcode_in            : G-code sliced from the DEFORMED STL
+    - coarse_stl_original : ORIGINAL segment geometry (unrefined) used to
+                            rebuild the heightmap Δz(x,y) AND to detect
+                            downward-facing surfaces for slowdown.
+    - out_dir             : where final printer-space G-code is written.
     """
 
-    base_no_ext, ext = os.path.splitext(filename)
-    if ext.lower() == ".stl":
-        part_name = base_no_ext
-    elif ext == "":
-        part_name = filename
-    else:
-        print(f"skip {filename}: not an STL")
+    max_seg_len = GEOMETRY_CONFIG["maximal_segment_length_mm"]
+    down_angle  = GEOMETRY_CONFIG["downward_angle_deg"]
+    slow_feed   = GEOMETRY_CONFIG["slow_feedrate_mm_per_min"]
+    z_min       = GEOMETRY_CONFIG["z_desired_min_mm"]
+    xy_x, xy_y  = GEOMETRY_CONFIG["xy_backtransform_shift_mm"]
+
+    out_path = transformGCode(
+        in_file=gcode_in,
+        stl_for_heightmap=coarse_stl_original,      # ORIGINAL pre-deform STL
+        out_dir=out_dir,
+        surface_for_slowdown=coarse_stl_original,   # FINAL geometry for slowdown
+        maximal_length=max_seg_len,
+        x_shift=xy_x,
+        y_shift=xy_y,
+        z_desired=z_min,
+        downward_angle_deg=down_angle,
+        slow_feedrate=slow_feed,
+        # MUST match transformSTL:
+        grid_nx=420,
+        grid_ny=420,
+        z_tol=0.05,
+        angle_deg=20.0,
+        blend_mm=0.35,
+        margin_mm=0.0,
+    )
+    return out_path
+
+
+# --------------------------------------------------------------------------
+#  SLICE + (OPTIONALLY) TRANSFORM ONE SEGMENT
+# --------------------------------------------------------------------------
+
+def sliceTransform(folder: dict, filename: str, bottom: bool = False, top: bool = False):
+    """
+    Process one segmented STL from stl_parts/:
+
+      1. Copy a coarse original (unrefined) mesh to stl_coarse/
+      2. Detect overhangs on that segment
+      3. If NONPLANAR (and NOT forced planar bottom) →
+           refine + heightmap deform + slice + backtransform
+      4. Else → planar slice only (no deformation)
+    """
+
+    base, ext = os.path.splitext(filename)
+    if ext.lower() != ".stl":
+        print(f"  [sliceTransform] Skipping non-STL file: {filename}")
         return
 
-    stl_parts_path   = os.path.join(folder["stl_parts"],   part_name + ".stl")
-    tf_surfaces_path = os.path.join(folder["tf_surfaces"], part_name + ".stl")
-    stl_tf_path      = os.path.join(folder["stl_tf"],      part_name + ".stl")
-    gcode_tf_path    = os.path.join(folder["gcode_tf"],    part_name + ".gcode")
-    gcode_parts_path = os.path.join(folder["gcode_parts"], part_name + ".gcode")
-    coarse_stl_path  = os.path.join(folder["stl_coarse"],  part_name + ".stl")
+    # Per-part paths
+    stl_part    = os.path.join(folder["stl_parts"],  base + ".stl")
+    stl_coarse  = os.path.join(folder["stl_coarse"], base + ".stl")
+    stl_tf      = os.path.join(folder["stl_tf"],     base + ".stl")
+    gcode_tf    = os.path.join(folder["gcode_tf"],   base + ".gcode")
+    gcode_final = os.path.join(folder["gcode_parts"], base + ".gcode")
 
-    # A part is considered "nonplanar" if there's a matching transform surface.
-    is_nonplanar = os.path.exists(tf_surfaces_path)
+    # 1) Coarse copy (original geometry BEFORE refinement/deformation)
+    if not os.path.exists(stl_part):
+        print(f"  [sliceTransform] WARNING: missing {stl_part}, skipping.")
+        return
 
-    # Coarse copy (for slowdown geometry). We keep the original, unrefined STL here.
-    if not os.path.exists(coarse_stl_path):
-        shutil.copyfile(stl_parts_path, coarse_stl_path)
+    if not os.path.exists(stl_coarse):
+        shutil.copyfile(stl_part, stl_coarse)
+        print(f"  [sliceTransform] Saved coarse copy → {stl_coarse}")
 
-    # Step 1: refine mesh if we are going to transform
-    # (We keep the same logic you had: refine only for nonplanar parts,
-    #  because planar parts don't need dense tessellation.)
-    if is_nonplanar:
-        print("  refining mesh:", stl_parts_path)
-        refineMesh(stl_parts_path, GEOMETRY_CONFIG["refine_edge_length_mm"])
+    # 2) Overhang detection for this SEGMENT
+    has_overhang = segment_has_overhang(stl_part)
+    print(f"  [sliceTransform] segment_has_overhang({filename}) = {has_overhang}")
 
-        # Step 2: apply nonplanar transform
-        print("  transforming STL using tf_surface:", tf_surfaces_path)
-        transformSTL(stl_parts_path, tf_surfaces_path, folder["stl_tf"])
+    # 3) BOTTOM OVERRIDE — ONLY if this is a TRUE bottom (multi-part)
+    #    If a model has only one segment (bottom=True & top=True),
+    #    we DO NOT override; it may be deformed & reverse-transformed.
+    if bottom and not top:
+        if has_overhang:
+            print("  [sliceTransform] BOTTOM OVERRIDE: segment has overhangs "
+                  "but is forced planar to keep a stable base.")
+        has_overhang = False
 
-        # Step 3: slice transformed STL -> gcode_tf
-        print("  slicing transformed part:", part_name)
+    # 4) NONPLANAR PATH  (overhanging AND not forced planar)
+    if has_overhang:
+        print(f"  [sliceTransform] Nonplanar segment → deform & backtransform: {filename}")
+
+        # 4.1 Refine mesh IN-PLACE for smoother deformation
+        refine_len = GEOMETRY_CONFIG["refine_edge_length_mm"]
+        print(f"    Refining mesh (edge length ≤ {refine_len} mm)…")
+        refineMesh(stl_part, refine_len)
+
+        # 4.2 Apply heightmap (column-freeze) deformation
+        print("    Applying column-freeze heightmap deformation (transformSTL)…")
+        tf_stl_path = transformSTL(
+            in_body=stl_part,
+            in_transform=None,      # ignored in column-freeze mode
+            out_dir=folder["stl_tf"],
+            grid_nx=420,
+            grid_ny=420,
+            z_tol=0.05,
+            angle_deg=20.0,
+            blend_mm=0.35,
+            margin_mm=0.0,
+        )
+
+        # 4.3 Slice the DEFORMED mesh
+        print("    Slicing transformed STL (execSlicer, transformed=True)…")
         execSlicer(
-            in_file=stl_tf_path,
-            out_file=gcode_tf_path,
+            in_file=tf_stl_path,
+            out_file=gcode_tf,
             bottom_stl=bottom,
             top_stl=top,
             transformed=True,
         )
 
-        # Step 4: backtransform & slowdown -> gcode_parts
-        print("  backtransform + slowdown:", part_name)
+        # 4.4 Reverse-transform G-code back to printer space + slowdown
+        print("    Backtransforming & slowdown (transformGCode)…")
         _backtransform_and_slowdown(
-            gcode_tf_path,
-            tf_surfaces_path,
-            folder["gcode_parts"],
-            coarse_stl_path,
+            gcode_in=gcode_tf,
+            coarse_stl_original=stl_coarse,
+            out_dir=folder["gcode_parts"],
         )
 
+    # 5) PLANAR PATH  (no overhang OR forced planar bottom)
     else:
-        # Planar path
-        print("  slicing planar part:", part_name)
+        print(f"  [sliceTransform] Planar segment (no deformation): {filename}")
+
+        # Slice the original planar segment directly
         execSlicer(
-            in_file=stl_parts_path,
-            out_file=gcode_parts_path,
+            in_file=stl_part,
+            out_file=gcode_final,
             bottom_stl=bottom,
             top_stl=top,
             transformed=False,
         )
 
-        # Optionally also run backtransform/slowdown for planar parts if requested
-        if PIPELINE_CONFIG["apply_backtransform_to_planar"]:
-            print("  (config) also applying slowdown to planar part:", part_name)
-            _backtransform_and_slowdown(
-                gcode_parts_path,     # input is already planar G-code
-                tf_surfaces_path,     # might not exist for planar -> you’d adapt if needed
-                folder["gcode_parts"],
-                coarse_stl_path,
-            )
+        # NOTE:
+        # We DO NOT call transformGCode for planar parts, because the mesh
+        # was never deformed. If in future you want "slowdown-only" on planar
+        # parts, that should be a separate path using only the FINAL geometry.
 
 
-def _backtransform_and_slowdown(
-    gcode_in,
-    tf_surface_stl,
-    out_dir,
-    coarse_surface_for_slowdown,
-):
+# --------------------------------------------------------------------------
+#  SLICE ALL SEGMENTS
+# --------------------------------------------------------------------------
+
+def sliceAll(folder: dict):
     """
-    Helper to call transformGCode() using GEOMETRY_CONFIG.
-    This wraps all those numeric knobs in one place.
+    Walk through stl_parts/ in sorted order and process each segment.
+    The first segment is 'bottom', the last is 'top'.
     """
 
-    max_seg_len   = GEOMETRY_CONFIG["maximal_segment_length_mm"]
-    down_angle    = GEOMETRY_CONFIG["downward_angle_deg"]
-    slow_feed     = GEOMETRY_CONFIG["slow_feedrate_mm_per_min"]
-    z_min         = GEOMETRY_CONFIG["z_desired_min_mm"]
-    xy_shift_x, xy_shift_y = GEOMETRY_CONFIG["xy_backtransform_shift_mm"]
-
-    # NOTE: our transformGCode signature from before was:
-    # transformGCode(
-    #   in_file,
-    #   in_transform_for_interp,
-    #   out_dir,
-    #   surface_for_slowdown,
-    #   maximal_length = ...,
-    #   x_shift = ...,
-    #   y_shift = ...,
-    #   z_desired = ...,
-    #   downward_angle_deg = ...,
-    #   slow_feedrate = ...
-    # )
-
-    # ✅ Replace the old call with this:
-    orig_stl_path = coarse_surface_for_slowdown
-
-    transformGCode(
-        in_file=gcode_in,
-        stl_for_heightmap=orig_stl_path,          # ← MUST be the ORIGINAL (pre-deform) STL
-        out_dir=out_dir,
-        surface_for_slowdown=coarse_surface_for_slowdown,  # FINAL STL for slowdown checks
-        maximal_length=max_seg_len,
-        x_shift=xy_shift_x,
-        y_shift=xy_shift_y,
-        z_desired=z_min,
-        downward_angle_deg=down_angle,
-        slow_feedrate=slow_feed,
-        # If you are NOT using the sidecar, also pass the exact heightmap params:
-        grid_nx=420, grid_ny=420, z_tol=0.05,
-        angle_deg=20, blend_mm=0.35, margin_mm=0.0
-    )
-
-
-
-def sliceAll(folder):
-    """
-    Go through all stl_parts/*.stl in sort order.
-    Mark first as bottom=True, last as top=True,
-    pass flags forward.
-    """
     parts = [
         f for f in os.listdir(folder["stl_parts"])
         if f.lower().endswith(".stl") and not f.startswith(".")
@@ -173,113 +233,78 @@ def sliceAll(folder):
     parts.sort()
 
     if not parts:
-        print("No STL parts found.")
+        print("[sliceAll] No segmented STL parts found in stl_parts/.")
         return
 
-    for idx, stlfile in enumerate(parts):
-        bottom_flag = (idx == 0)
-        top_flag    = (idx == len(parts) - 1)
-
-        print("Processing:",
-              stlfile,
-              "| bottom =", bottom_flag,
-              "| top =", top_flag)
-
-        sliceTransform(
-            folder,
-            stlfile,
-            bottom=bottom_flag,
-            top=top_flag,
-        )
+    for idx, fname in enumerate(parts):
+        bottom = (idx == 0)
+        top    = (idx == len(parts) - 1)
+        print(f"\n=== Processing {fname}  | bottom={bottom} | top={top} ===")
+        sliceTransform(folder, fname, bottom=bottom, top=top)
 
 
-def createFoldersIfMissing(folder_dict):
-    """
-    Ensure all working directories exist.
-    """
-    for key in folder_dict:
-        p = folder_dict[key]
-        if not os.path.exists(p):
-            os.makedirs(p, exist_ok=True)
+# --------------------------------------------------------------------------
+#  MAIN PIPELINE
+# --------------------------------------------------------------------------
 
+def main(input_stl: str):
 
-def main(input_stl):
-    """
-    Full pipeline:
-    1. Build folder layout
-    2. Analyse STL -> cuts.txt
-    3. Copy STL into work dir, run cutSTL() to produce stl_parts
-    4. sliceAll() -> slice each part (nonplanar or planar)
-    5. combineGCode() merges all part G-codes
-    6. moveGCode() shifts final merged toolpath on the bed (optional)
-    """
+    purge_heightmaps()
+    base = os.path.splitext(os.path.basename(input_stl))[0]
+    folders = make_folder_dict(base)
 
-    base_name = os.path.splitext(os.path.basename(input_stl))[0]
-    folders = make_folder_dict(base_name)
-
-    print("Create folders if missing …")
-    t0 = time.time()
+    print("\n=== Creating pipeline folders ===")
     createFoldersIfMissing(folders)
 
-    cuts_txt_path = os.path.join(folders["root"], "cuts.txt")
-    working_input_stl = os.path.join(folders["root"], base_name + ".stl")
+    # Clean working dirs to avoid mixing old/new runs
+    for key in ["stl_parts", "stl_coarse", "stl_tf", "gcode_tf", "gcode_parts"]:
+        if key in folders:
+            print(f"[init] Clearing folder: {folders[key]}")
+            _clear_folder(folders[key])
 
-    # Analyse STL (if we don't have cuts already)
-    if not os.path.exists(cuts_txt_path):
-        print("Analyse STL to determine cut heights …")
-        analyseSTL(input_stl, cuts_txt_path)
+    cuts_txt    = os.path.join(folders["root"], "cuts.txt")
+    working_stl = os.path.join(folders["root"], base + ".stl")
 
-    # Copy the input STL into working root (if config says so)
-    if PIPELINE_CONFIG["copy_input_to_work"]:
-        print("Copy input STL into working root …")
-        shutil.copy(input_stl, working_input_stl)
-        stl_for_cutting = working_input_stl
+    # 1. Analyse STL → ALWAYS recompute cut heights
+    print("\n=== Analysing STL for cut heights (always recompute) ===")
+    analyseSTL(input_stl, cuts_txt)
+
+    # 2. Copy STL into working directory (so we can safely mutate it in cutSTL)
+    if PIPELINE_CONFIG.get("copy_input_to_work", True):
+        print("Copying input STL into working root…")
+        shutil.copyfile(input_stl, working_stl)
+        stl_for_cut = working_stl
     else:
-        stl_for_cutting = input_stl
+        stl_for_cut = input_stl
 
-    # Cut STL into individual vertical segments -> stl_parts/
-    print("Cut STL into vertical parts …")
-    cutSTL(
-        in_stl=stl_for_cutting,
-        cuts_file=cuts_txt_path,
-        out_folder=folders["stl_parts"],
-    )
+    # 3. Cut STL into vertical segments (uses safety-offset logic in _02cutstl)
+    print("\n=== Cutting STL into parts ===")
+    cutSTL(stl_for_cut, cuts_txt, folders["stl_parts"])
 
-    # Slice all parts (and transform/backtransform where needed)
-    print("Slice all parts …")
+    # 4. Slice + (if needed) deform segments
+    print("\n=== Slicing all parts ===")
     sliceAll(folders)
 
-    # Combine final segments' G-code into one combined file
-    combined_gcode_path = os.path.join(folders["root"], base_name + ".gcode")
-    print("Combine G-code parts …")
-    combineGCode(
-        in_folder=folders["gcode_parts"],
-        out_file=combined_gcode_path,
-    )
+    # 5. Combine per-part G-code
+    combined_path = os.path.join(folders["root"], base + ".gcode")
+    print("\n=== Combining G-code ===")
+    combineGCode(folders["gcode_parts"], combined_path)
 
-    # Optionally apply final XY shift
-    shifted_gcode_path = os.path.join(folders["root"], base_name + "_moved.gcode")
+    # 6. Optional final XY shift on the whole merged toolpath
+    shifted_path = os.path.join(folders["root"], base + "_moved.gcode")
 
-    if PIPELINE_CONFIG["apply_final_shift"]:
-        print("Apply final XY shift to merged G-code …")
+    if PIPELINE_CONFIG.get("apply_final_shift", False):
+        print("\n=== Applying final XY shift ===")
         x_off, y_off = PIPELINE_CONFIG["final_shift_xy_mm"]
-        moveGCode(
-            in_file=combined_gcode_path,
-            out_file=shifted_gcode_path,
-            x_off=x_off,
-            y_off=y_off,
-        )
-        print("Shifted G-code:", shifted_gcode_path)
+        moveGCode(combined_path, shifted_path, x_off, y_off)
+        print("Shifted file:", shifted_path)
     else:
-        print("Skipping final XY shift (config).")
+        print("Skipping final XY shift (PIPELINE_CONFIG.apply_final_shift = False).")
 
-    dt = time.time() - t0
-    print("Pipeline finished in {:.1f}s".format(dt))
-    print("Combined (unshifted):", combined_gcode_path)
+    print("\n=== PIPELINE COMPLETE ===")
+    print("Combined G-code (unshifted):", combined_path)
 
 
 if __name__ == "__main__":
-    stl_arg = in_file
-    if len(sys.argv) > 1:
-        stl_arg = sys.argv[1]
+    stl_arg = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_INPUT
     main(stl_arg)

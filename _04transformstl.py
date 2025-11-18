@@ -108,6 +108,8 @@ def transformSTL(in_body, in_transform, out_dir,
     accepted for compatibility but IGNORED.
 
     Output is written to 'out_dir' with the same base filename.
+    Additionally, a heightmap Δz(x,y) is saved into heightmaps/<name>_heightmap.npz
+    for visualization.
     """
     start = time.time()
     print("[transformSTL] START (embedded column-freeze)")
@@ -149,9 +151,10 @@ def transformSTL(in_body, in_transform, out_dir,
     s = sin(radians(angle_deg))
     blend = max(1e-6, float(blend_mm))  # guard
 
-    # nearest-cell lookup for mask
     ny, nx = supported.shape
+
     def mask_at(x, y):
+        # nearest-cell lookup for mask
         u = int(round((x - xmin) / dx))
         v = int(round((y - ymin) / dy))
         u = max(0, min(nx-1, u))
@@ -174,6 +177,40 @@ def transformSTL(in_body, in_transform, out_dir,
 
         dz = (d * s) * w
         V_new[idx, 2] = z + dz
+
+    # ---------------------------------------------------------
+    # SAVE HEIGHTMAP FIELD FOR VISUALIZATION
+    # ---------------------------------------------------------
+    # Δz on the regular grid: same formula, but evaluated at grid points.
+    DZ = np.zeros_like(dist_out, dtype=float)
+    for j in range(ny):
+        for i in range(nx):
+            if supported[j, i]:
+                DZ[j, i] = 0.0
+            else:
+                d = dist_out[j, i]
+                w = _smoothstep_cos(d / blend)
+                DZ[j, i] = (d * s) * w
+
+    vis_folder = os.path.join("heightmaps")
+    os.makedirs(vis_folder, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(in_body))[0]
+    npz_path = os.path.join(vis_folder, f"{base_name}_heightmap.npz")
+
+    np.savez_compressed(
+        npz_path,
+        X=X,
+        Y=Y,
+        DZ=DZ,
+        supported=supported,
+        dist_out=dist_out,
+        xmin=xmin,
+        ymin=ymin,
+        dx=dx,
+        dy=dy
+    )
+    print(f"[transformSTL]   Saved heightmap → {npz_path}")
 
     # --- Save deformed STL --------------------------------------------------
     new_vecs = V_new.reshape((-1, 3, 3))
