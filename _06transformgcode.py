@@ -34,25 +34,36 @@ from scipy.ndimage import distance_transform_edt as edt
 
 # Max segment length (XY) for pre-segmentation of test_4.gcode.
 # This only affects test/gcode_parts/test_4.gcode.
-PRESEG_MAX_LEN = 0.15
+PRESEG_MAX_LEN = 0.3
 
 
-def _should_presegment_test2(in_file: str) -> bool:
+def _should_presegment(in_file: str) -> bool:
     """
-    Return True ONLY for the file:
+    Return True ONLY for these exact files:
+        test/gcode_tf/test_2.gcode
         test/gcode_tf/test_4.gcode
+        test/gcode_tf/test_5.gcode
+
+    Any other G-code file → pre-segmentation DISABLED.
     """
     norm_path = os.path.normpath(os.path.abspath(in_file))
 
-    # CORRECT tail for your real folder structure
-    target_tail = os.path.normpath(os.path.join("test", "gcode_tf", "test_4.gcode"))
+    # --- Exact tails we want to match ---
+    TARGET_TAILS = [
+        os.path.normpath(os.path.join("test", "gcode_tf", "test_2.gcode")),
+        os.path.normpath(os.path.join("test", "gcode_tf", "test_4.gcode")),
+        os.path.normpath(os.path.join("test", "gcode_tf", "test_5.gcode")),
+    ]
 
-    if norm_path.endswith(target_tail):
-        print("[transformGCode] Pre-segmentation ENABLED for test/gcode_tf/test_4.gcode")
-        return True
+    # Check if this file matches any exact tail
+    for tail in TARGET_TAILS:
+        if norm_path.endswith(tail):
+            print(f"[transformGCode] Pre-segmentation ENABLED for {tail}")
+            return True
 
     print("[transformGCode] Pre-segmentation DISABLED for this file.")
     return False
+
 
 
 
@@ -720,7 +731,7 @@ def transformGCode(
         data = f_gcode.readlines()
 
     # 1b) Optional pre-segmentation ONLY for test_2.gcode
-    use_preseg = _should_presegment_test2(in_file)
+    use_preseg = _should_presegment(in_file)
     if use_preseg:
         data = pre_subdivide_gcode_moves(data, max_seg_len=PRESEG_MAX_LEN)
         internal_max_length = 1e9  # effectively disable further segmentation
