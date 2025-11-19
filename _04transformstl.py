@@ -5,6 +5,7 @@ import numpy as np
 from math import radians, sin, cos, pi
 from stl import mesh
 from scipy.ndimage import distance_transform_edt as edt
+from scipy.ndimage import gaussian_filter   # <-- ADDED FOR SMOOTHING
 
 
 # ---------------- utils ----------------
@@ -30,14 +31,13 @@ def _rasterize_supported_mask(triangles_xyz, X, Y, zmin, z_tol):
     mean_z = tri[:, :, 2].mean(axis=1)
     sup_tris = tri[mean_z <= (zmin + z_tol)]
     if sup_tris.shape[0] == 0:
-        return inside  # empty mask
+        return inside
 
     for t in sup_tris:
         x = t[:, 0]; y = t[:, 1]
         xmin = float(x.min()); xmax = float(x.max())
         ymin = float(y.min()); ymax = float(y.max())
 
-        # grid window
         i0 = int(np.clip(np.floor((xmin - x0) / dx), 0, nx - 1))
         i1 = int(np.clip(np.ceil ((xmax - x0) / dx), 0, nx - 1))
         j0 = int(np.clip(np.floor((ymin - y0) / dy), 0, ny - 1))
@@ -45,13 +45,12 @@ def _rasterize_supported_mask(triangles_xyz, X, Y, zmin, z_tol):
         if i1 < i0 or j1 < j0:
             continue
 
-        # barycentric inclusion on subgrid
         p0 = np.array([x[0], y[0]])
         p1 = np.array([x[1], y[1]])
         p2 = np.array([x[2], y[2]])
         v0 = p2 - p0
         v1 = p1 - p0
-        denom = (v0[0]*v1[1] - v0[1]*v1[0])
+        denom = (v0[0] * v1[1] - v0[1] * v1[0])
         if abs(denom) < 1e-12:
             continue
         inv_d = 1.0 / denom
@@ -76,10 +75,8 @@ def _bilinear_sample(Z, x, y, xmin, ymin, dx, dy):
     i1 = i0 + 1; j1 = j0 + 1
 
     nx = Z.shape[1]; ny = Z.shape[0]
-    i0 = max(0, min(nx-1, i0))
-    i1 = max(0, min(nx-1, i1))
-    j0 = max(0, min(ny-1, j0))
-    j1 = max(0, min(ny-1, j1))
+    i0 = max(0, min(nx-1, i0)); i1 = max(0, min(nx-1, i1))
+    j0 = max(0, min(ny-1, j0)); j1 = max(0, min(ny-1, j1))
 
     fu = u - np.floor(u)
     fv = v - np.floor(v)
@@ -91,7 +88,6 @@ def _bilinear_sample(Z, x, y, xmin, ymin, dx, dy):
     return z0*(1-fv) + z1*fv
 
 def _smoothstep_cos(t):
-    """0..1 smooth step using a raised cosine."""
     t = np.clip(t, 0.0, 1.0)
     return 0.5 - 0.5*cos(pi*t)
 
@@ -102,30 +98,18 @@ def transformSTL(in_body, in_transform, out_dir,
                  grid_nx=420, grid_ny=420,
                  z_tol=0.05, angle_deg=20.0,
                  blend_mm=0.35, margin_mm=0.0):
-    """
-    Deform (lift/warp) an STL mesh 'in_body' using the embedded COLUMN-FREEZE
-    heightmap math (no external surface). The legacy 'in_transform' argument is
-    accepted for compatibility but IGNORED.
 
-    Output is written to 'out_dir' with the same base filename.
-    Additionally, a heightmap Δz(x,y) is saved into heightmaps/<name>_heightmap.npz
-    for visualization.
-    """
     start = time.time()
     print("[transformSTL] START (embedded column-freeze)")
     print(f"[transformSTL]   in_body      = {in_body}")
     if in_transform is not None:
-        print("[transformSTL]   NOTE: 'in_transform' provided but ignored (column-freeze mode)")
+        print("[transformSTL]   NOTE: 'in_transform' ignored (column-freeze mode)")
     print(f"[transformSTL]   out_dir      = {out_dir}")
-    print(f"[transformSTL]   params       = grid={grid_nx}x{grid_ny}  z_tol={z_tol}  "
-          f"blend_mm={blend_mm}  angle={angle_deg}°  margin={margin_mm}")
 
-    # --- Load STL to be deformed -------------------------------------------
     m_in = mesh.Mesh.from_file(in_body)
-    Vtri = m_in.vectors.copy()             # (T,3,3)
-    V = Vtri.reshape(-1, 3)                # (N,3)
+    Vtri = m_in.vectors.copy()
+    V = Vtri.reshape(-1, 3)
 
-    # Bounding box & base
     xmin = float(V[:,0].min()); xmax = float(V[:,0].max())
     ymin = float(V[:,1].min()); ymax = float(V[:,1].max())
     zmin = float(V[:,2].min())
@@ -134,54 +118,41 @@ def transformSTL(in_body, in_transform, out_dir,
         xmin -= margin_mm; ymin -= margin_mm
         xmax += margin_mm; ymax += margin_mm
 
-    # --- Build XY grid over footprint --------------------------------------
     X, Y = _grid_over_bbox(xmin, xmax, ymin, ymax, int(grid_nx), int(grid_ny))
     dx = (xmax - xmin) / max(int(grid_nx) - 1, 1)
     dy = (ymax - ymin) / max(int(grid_ny) - 1, 1)
 
-    # --- Supported mask at the cut plane -----------------------------------
     supported = _rasterize_supported_mask(Vtri, X, Y, zmin, float(z_tol))
     if not supported.any():
-        raise RuntimeError("No supported footprint found. Try increasing z_tol slightly.")
+        raise RuntimeError("No supported footprint found — increase z_tol.")
 
-    # --- Outside distance field (mm) ----------------------------------------
-    dist_out = edt(~supported, sampling=(dy, dx))  # (ny,nx)
+    dist_out = edt(~supported, sampling=(dy, dx))
 
-    # --- Column-freeze deformation -----------------------------------------
     s = sin(radians(angle_deg))
-    blend = max(1e-6, float(blend_mm))  # guard
-
+    blend = max(1e-6, float(blend_mm))
     ny, nx = supported.shape
 
     def mask_at(x, y):
-        # nearest-cell lookup for mask
         u = int(round((x - xmin) / dx))
         v = int(round((y - ymin) / dy))
         u = max(0, min(nx-1, u))
         v = max(0, min(ny-1, v))
         return supported[v, u]
 
+    # ---------------- APPLY DEFORMATION ----------------
     V_new = V.copy()
     for idx in range(V.shape[0]):
         x, y, z = V[idx]
 
-        # Freeze any column whose (x,y) lies inside supported XY footprint
         if mask_at(x, y):
             continue
 
-        # Distance from supported boundary (bilinear sampled)
         d = _bilinear_sample(dist_out, x, y, xmin, ymin, dx, dy)
-
-        # Smooth ramp from 0 at boundary to 1 past blend_mm
         w = _smoothstep_cos(d / blend)
-
         dz = (d * s) * w
         V_new[idx, 2] = z + dz
 
-    # ---------------------------------------------------------
-    # SAVE HEIGHTMAP FIELD FOR VISUALIZATION
-    # ---------------------------------------------------------
-    # Δz on the regular grid: same formula, but evaluated at grid points.
+    # ---------------- BUILD HEIGHTMAP FOR SAVING ----------------
     DZ = np.zeros_like(dist_out, dtype=float)
     for j in range(ny):
         for i in range(nx):
@@ -192,6 +163,17 @@ def transformSTL(in_body, in_transform, out_dir,
                 w = _smoothstep_cos(d / blend)
                 DZ[j, i] = (d * s) * w
 
+    # ---------------------------------------------------------
+    # RIDGE-SMOOTHING FIX (Gaussian filter)
+    # ---------------------------------------------------------
+    print("[transformSTL]   Applying ridge-smoothing (Gaussian blur σ=3.0)")
+    mask_zero = supported.copy()
+    DZ_smooth = gaussian_filter(DZ, sigma=5.0)
+    DZ_smooth[mask_zero] = 0.0
+    DZ = DZ_smooth
+    # ---------------------------------------------------------
+
+    # ---------------- SAVE HEIGHTMAP ----------------
     vis_folder = os.path.join("heightmaps")
     os.makedirs(vis_folder, exist_ok=True)
 
@@ -200,19 +182,16 @@ def transformSTL(in_body, in_transform, out_dir,
 
     np.savez_compressed(
         npz_path,
-        X=X,
-        Y=Y,
+        X=X, Y=Y,
         DZ=DZ,
         supported=supported,
         dist_out=dist_out,
-        xmin=xmin,
-        ymin=ymin,
-        dx=dx,
-        dy=dy
+        xmin=xmin, ymin=ymin,
+        dx=dx, dy=dy
     )
     print(f"[transformSTL]   Saved heightmap → {npz_path}")
 
-    # --- Save deformed STL --------------------------------------------------
+    # ---------------- SAVE OUTPUT STL ----------------
     new_vecs = V_new.reshape((-1, 3, 3))
     out_mesh = mesh.Mesh(np.zeros(new_vecs.shape[0], dtype=mesh.Mesh.dtype))
     out_mesh.vectors[:] = new_vecs
@@ -229,17 +208,15 @@ def transformSTL(in_body, in_transform, out_dir,
     return output_path
 
 
-# ---------------------------------------------------------------------------
-# Standalone test hook
-# ---------------------------------------------------------------------------
+# ---------------- Standalone test hook ----------------
 if __name__ == "__main__":
     example_in_body      = os.path.join("stl_parts", "test_2.stl")
-    example_in_transform = os.path.join("tf_surfaces", "ignored_surface.stl")  # ignored
+    example_in_transform = os.path.join("tf_surfaces", "ignored_surface.stl")
     example_out_dir      = "stl_tf"
 
     transformSTL(
         in_body=example_in_body,
-        in_transform=example_in_transform,  # compat, ignored
+        in_transform=example_in_transform,
         out_dir=example_out_dir,
         grid_nx=420, grid_ny=420,
         z_tol=0.05, angle_deg=20.0,

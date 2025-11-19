@@ -34,7 +34,7 @@ from scipy.ndimage import distance_transform_edt as edt
 
 # Max segment length (XY) for pre-segmentation of test_4.gcode.
 # This only affects test/gcode_parts/test_4.gcode.
-PRESEG_MAX_LEN = 0.3
+PRESEG_MAX_LEN = 0.25
 
 
 def _should_presegment(in_file: str) -> bool:
