@@ -1,11 +1,14 @@
-# transformgcode.py
+# _06transformgcode.py
 # Reverse-transform G-code sliced from a HEIGHTMAP-deformed STL back to printer space,
 # using the same column-freeze heightmap math as heightmap_gen.py.
 #
-# Also preserves your original pipeline behavior:
-#  - XY segmentation (maximal_length)
-#  - perimeter/infill detection via comments
-#  - slowdown on downward-facing perimeters using a spatial index over FINAL geometry
+# Behavior:
+#  - For most models: original stable behavior
+#       * XY segmentation in backtransform_data (maximal_length)
+#       * slowdown on downward-facing perimeters
+#  - For ONE specific file: test/gcode_parts/test_2.gcode
+#       * Pre-segmentation of XY moves BEFORE reverse mapping
+#       * Internal segmentation in backtransform_data effectively disabled
 #
 # Inputs:
 #   - in_file: G-code produced by slicing the DEFORMED mesh
@@ -25,14 +28,43 @@ import numpy as np
 from stl import mesh
 from scipy.ndimage import distance_transform_edt as edt
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  CONFIG: which file gets pre-segmentation
+# ---------------------------------------------------------------------------
+
+# Max segment length (XY) for pre-segmentation of test_4.gcode.
+# This only affects test/gcode_parts/test_4.gcode.
+PRESEG_MAX_LEN = 0.15
+
+
+def _should_presegment_test2(in_file: str) -> bool:
+    """
+    Return True ONLY for the file:
+        test/gcode_tf/test_4.gcode
+    """
+    norm_path = os.path.normpath(os.path.abspath(in_file))
+
+    # CORRECT tail for your real folder structure
+    target_tail = os.path.normpath(os.path.join("test", "gcode_tf", "test_4.gcode"))
+
+    if norm_path.endswith(target_tail):
+        print("[transformGCode] Pre-segmentation ENABLED for test/gcode_tf/test_4.gcode")
+        return True
+
+    print("[transformGCode] Pre-segmentation DISABLED for this file.")
+    return False
+
+
+
+# ---------------------------------------------------------------------------
 # Heightmap (column-freeze) utilities — SAME MATH AS heightmap_gen.py
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def grid_over_bbox(xmin, xmax, ymin, ymax, nx, ny):
     xs = np.linspace(xmin, xmax, nx)
     ys = np.linspace(ymin, ymax, ny)
     return np.meshgrid(xs, ys)
+
 
 def rasterize_supported_mask(triangles_xyz, X, Y, zmin, z_tol):
     """
@@ -44,7 +76,8 @@ def rasterize_supported_mask(triangles_xyz, X, Y, zmin, z_tol):
     dx = (X[0, 1] - X[0, 0]) if X.shape[1] > 1 else 1.0
     dy = (Y[1, 0] - Y[0, 0]) if X.shape[0] > 1 else 1.0
     x0, y0 = X[0, 0], Y[0, 0]
-    nx = X.shape[1]; ny = X.shape[0]
+    nx = X.shape[1]
+    ny = X.shape[0]
 
     tri = triangles_xyz  # (T,3,3)
     mean_z = tri[:, :, 2].mean(axis=1)
@@ -53,15 +86,18 @@ def rasterize_supported_mask(triangles_xyz, X, Y, zmin, z_tol):
         return inside  # empty
 
     for t in sup_tris:
-        x = t[:, 0]; y = t[:, 1]
-        xmin = float(x.min()); xmax = float(x.max())
-        ymin = float(y.min()); ymax = float(y.max())
+        x = t[:, 0]
+        y = t[:, 1]
+        xmin_t = float(x.min())
+        xmax_t = float(x.max())
+        ymin_t = float(y.min())
+        ymax_t = float(y.max())
 
         # compute grid window
-        i0 = int(np.clip(np.floor((xmin - x0) / dx), 0, nx - 1))
-        i1 = int(np.clip(np.ceil ((xmax - x0) / dx), 0, nx - 1))
-        j0 = int(np.clip(np.floor((ymin - y0) / dy), 0, ny - 1))
-        j1 = int(np.clip(np.ceil ((ymax - y0) / dy), 0, ny - 1))
+        i0 = int(np.clip(np.floor((xmin_t - x0) / dx), 0, nx - 1))
+        i1 = int(np.clip(np.ceil((xmax_t - x0) / dx), 0, nx - 1))
+        j0 = int(np.clip(np.floor((ymin_t - y0) / dy), 0, ny - 1))
+        j1 = int(np.clip(np.ceil((ymax_t - y0) / dy), 0, ny - 1))
         if i1 < i0 or j1 < j0:
             continue
 
@@ -71,48 +107,56 @@ def rasterize_supported_mask(triangles_xyz, X, Y, zmin, z_tol):
         p2 = np.array([x[2], y[2]])
         v0 = p2 - p0
         v1 = p1 - p0
-        denom = (v0[0]*v1[1] - v0[1]*v1[0])
+        denom = (v0[0] * v1[1] - v0[1] * v1[0])
         if abs(denom) < 1e-12:
             continue
         inv_d = 1.0 / denom
 
-        subX = X[j0:j1+1, i0:i1+1]
-        subY = Y[j0:j1+1, i0:i1+1]
+        subX = X[j0:j1 + 1, i0:i1 + 1]
+        subY = Y[j0:j1 + 1, i0:i1 + 1]
         qx = subX - p0[0]
         qy = subY - p0[1]
         u = (qx * v1[1] - qy * v1[0]) * inv_d
         v = (qy * v0[0] - qx * v0[1]) * inv_d
         w = 1.0 - u - v
         mask = (u >= 0) & (v >= 0) & (w >= 0)
-        inside[j0:j1+1, i0:i1+1] |= mask
+        inside[j0:j1 + 1, i0:i1 + 1] |= mask
 
     return inside
+
 
 def bilinear_sample(Z, x, y, xmin, ymin, dx, dy):
     """Bilinear sample Z on a regular grid for world (x,y)."""
     u = (x - xmin) / dx
     v = (y - ymin) / dy
-    i0 = int(np.floor(u)); j0 = int(np.floor(v))
-    i1 = i0 + 1; j1 = j0 + 1
+    i0 = int(np.floor(u))
+    j0 = int(np.floor(v))
+    i1 = i0 + 1
+    j1 = j0 + 1
 
-    nx = Z.shape[1]; ny = Z.shape[0]
-    i0 = max(0, min(nx-1, i0))
-    i1 = max(0, min(nx-1, i1))
-    j0 = max(0, min(ny-1, j0))
-    j1 = max(0, min(ny-1, j1))
+    nx = Z.shape[1]
+    ny = Z.shape[0]
+    i0 = max(0, min(nx - 1, i0))
+    i1 = max(0, min(nx - 1, i1))
+    j0 = max(0, min(ny - 1, j0))
+    j1 = max(0, min(ny - 1, j1))
 
     fu = u - np.floor(u)
     fv = v - np.floor(v)
 
-    z00 = Z[j0, i0]; z10 = Z[j0, i1]
-    z01 = Z[j1, i0]; z11 = Z[j1, i1]
-    z0 = z00*(1-fu) + z10*fu
-    z1 = z01*(1-fu) + z11*fu
-    return z0*(1-fv) + z1*fv
+    z00 = Z[j0, i0]
+    z10 = Z[j0, i1]
+    z01 = Z[j1, i0]
+    z11 = Z[j1, i1]
+    z0 = z00 * (1 - fu) + z10 * fu
+    z1 = z01 * (1 - fu) + z11 * fu
+    return z0 * (1 - fv) + z1 * fv
+
 
 def smoothstep_cos(t):
     t = np.clip(t, 0.0, 1.0)
-    return 0.5 - 0.5*math.cos(math.pi*t)
+    return 0.5 - 0.5 * math.cos(math.pi * t)
+
 
 def build_heightmap_field(in_stl, grid_nx, grid_ny, z_tol, angle_deg, blend_mm, margin_mm):
     """
@@ -120,16 +164,20 @@ def build_heightmap_field(in_stl, grid_nx, grid_ny, z_tol, angle_deg, blend_mm, 
     Returns: (xmin, ymin, dx, dy, dist_out, supported, sin(angle), blend)
     """
     m_in = mesh.Mesh.from_file(in_stl)
-    Vtri = m_in.vectors.copy()             # (T,3,3)
-    V = Vtri.reshape(-1, 3)                # (N,3)
+    Vtri = m_in.vectors.copy()  # (T,3,3)
+    V = Vtri.reshape(-1, 3)      # (N,3)
 
-    xmin = float(V[:,0].min()); xmax = float(V[:,0].max())
-    ymin = float(V[:,1].min()); ymax = float(V[:,1].max())
-    zmin = float(V[:,2].min())
+    xmin = float(V[:, 0].min())
+    xmax = float(V[:, 0].max())
+    ymin = float(V[:, 1].min())
+    ymax = float(V[:, 1].max())
+    zmin = float(V[:, 2].min())
 
     if margin_mm > 0:
-        xmin -= margin_mm; ymin -= margin_mm
-        xmax += margin_mm; ymax += margin_mm
+        xmin -= margin_mm
+        ymin -= margin_mm
+        xmax += margin_mm
+        ymax += margin_mm
 
     X, Y = grid_over_bbox(xmin, xmax, ymin, ymax, int(grid_nx), int(grid_ny))
     dx = (xmax - xmin) / max(int(grid_nx) - 1, 1)
@@ -144,14 +192,15 @@ def build_heightmap_field(in_stl, grid_nx, grid_ny, z_tol, angle_deg, blend_mm, 
     blend = max(1e-6, float(blend_mm))
     return xmin, ymin, dx, dy, dist_out, supported, s, blend
 
+
 def dz_at(x, y, xmin, ymin, dx, dy, dist_out, supported, s, blend):
     """Compute Δz(x,y) with column-freeze (0 inside supported footprint)."""
     # freeze: nearest-cell lookup in supported mask
     u = int(round((x - xmin) / dx))
     v = int(round((y - ymin) / dy))
     ny, nx = supported.shape
-    u = max(0, min(nx-1, u))
-    v = max(0, min(ny-1, v))
+    u = max(0, min(nx - 1, u))
+    v = max(0, min(ny - 1, v))
     if supported[v, u]:
         return 0.0
 
@@ -159,9 +208,10 @@ def dz_at(x, y, xmin, ymin, dx, dy, dist_out, supported, s, blend):
     w = smoothstep_cos(d / blend)
     return (d * s) * w
 
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Geometry helpers for slowdown (DOWNWARD-facing perimeters in FINAL geometry)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def triangle_data_from_mesh(stl_path, max_angle_deg=10.0):
     """
@@ -201,27 +251,32 @@ def triangle_data_from_mesh(stl_path, max_angle_deg=10.0):
     print(f"Downward-facing triangles (<= {max_angle_deg:.1f}° from -Z): {downward_tris}")
     return triangles
 
+
 def build_triangle_spatial_index(triangles, cell_size=2.0):
     grid = {}
+
     def cid(x, y, z):
         return (int(np.floor(x / cell_size)),
                 int(np.floor(y / cell_size)),
                 int(np.floor(z / cell_size)))
+
     for tri in triangles:
-        mn = tri["aabb_min"]; mx = tri["aabb_max"]
+        mn = tri["aabb_min"]
+        mx = tri["aabb_max"]
         PAD = 1.0
         x0, y0, z0 = mn - PAD
         x1, y1, z1 = mx + PAD
         ix0, iy0, iz0 = cid(x0, y0, z0)
         ix1, iy1, iz1 = cid(x1, y1, z1)
-        for ix in range(ix0, ix1+1):
-            for iy in range(iy0, iy1+1):
-                for iz in range(iz0, iz1+1):
+        for ix in range(ix0, ix1 + 1):
+            for iy in range(iy0, iy1 + 1):
+                for iz in range(iz0, iz1 + 1):
                     key = (ix, iy, iz)
                     if key not in grid:
                         grid[key] = []
                     grid[key].append(tri)
     return grid, cell_size
+
 
 def query_triangles_near_point(p, grid, cell_size):
     x, y, z = p
@@ -235,27 +290,36 @@ def query_triangles_near_point(p, grid, cell_size):
         candidates.extend(grid[key])
     return candidates
 
+
 def point_near_downward_surface(midpoint, tri_grid, cell_size, dist_tol=0.4):
     nearby = query_triangles_near_point(midpoint, tri_grid, cell_size)
     if not nearby:
         return False
     mx, my, mz = midpoint
     for tri in nearby:
-        p0 = tri["p0"]; p1 = tri["p1"]; p2 = tri["p2"]; n = tri["normal"]
-        aabb_min = tri["aabb_min"]; aabb_max = tri["aabb_max"]
+        p0 = tri["p0"]
+        p1 = tri["p1"]
+        p2 = tri["p2"]
+        n = tri["normal"]
+        aabb_min = tri["aabb_min"]
+        aabb_max = tri["aabb_max"]
         PAD = 0.5
-        if (mx < aabb_min[0]-PAD or mx > aabb_max[0]+PAD or
-            my < aabb_min[1]-PAD or my > aabb_max[1]+PAD or
-            mz < aabb_min[2]-PAD or mz > aabb_max[2]+PAD):
+        if (mx < aabb_min[0] - PAD or mx > aabb_max[0] + PAD or
+                my < aabb_min[1] - PAD or my > aabb_max[1] + PAD or
+                mz < aabb_min[2] - PAD or mz > aabb_max[2] + PAD):
             continue
         v_mid = midpoint - p0
         d_signed = np.dot(v_mid, n)
         if abs(d_signed) > dist_tol:
             continue
         proj = midpoint - d_signed * n
-        v0 = p2 - p0; v1 = p1 - p0; v2 = proj - p0
-        dot00 = np.dot(v0, v0); dot01 = np.dot(v0, v1)
-        dot02 = np.dot(v0, v2); dot11 = np.dot(v1, v1)
+        v0 = p2 - p0
+        v1 = p1 - p0
+        v2 = proj - p0
+        dot00 = np.dot(v0, v0)
+        dot01 = np.dot(v0, v1)
+        dot02 = np.dot(v0, v2)
+        dot11 = np.dot(v1, v1)
         dot12 = np.dot(v1, v2)
         denom = (dot00 * dot11 - dot01 * dot01)
         if abs(denom) < 1e-16:
@@ -268,14 +332,16 @@ def point_near_downward_surface(midpoint, tri_grid, cell_size, dist_tol=0.4):
             return True
     return False
 
+
 def segment_near_downward_surface(p_start, p_mid, p_end, tri_grid, cell_size, dist_tol=0.4):
     return (point_near_downward_surface(p_start, tri_grid, cell_size, dist_tol) or
             point_near_downward_surface(p_mid,   tri_grid, cell_size, dist_tol) or
             point_near_downward_surface(p_end,   tri_grid, cell_size, dist_tol))
 
-# -----------------------------------------------------------------------------
-# G-code helpers (unchanged style from your previous pipeline)
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# G-code helpers (unchanged from stable pipeline)
+# ---------------------------------------------------------------------------
 
 def insert_Z(row, z_value):
     pattern_Z = r'Z[-0-9.]+[.]?[0-9]*'
@@ -291,6 +357,7 @@ def insert_Z(row, z_value):
         return row[:mX.end(0)] + ' Z' + str(round(z_value, 3)) + row[mX.end(0):]
     return 'Z' + str(round(z_value, 3)) + ' ' + row
 
+
 def replace_E(row, corr_value):
     pattern_E = r'E[-0-9.]+[.]?[0-9]*'
     m = re.search(pattern_E, row)
@@ -305,19 +372,25 @@ def replace_E(row, corr_value):
             e_new = 0.0
     return row[:m.start(0)] + ('E' + str(e_new)) + row[m.end(0):]
 
+
 def clean_and_set_feedrate(row, feed_mm_min):
     row_noF = re.sub(r'F[-0-9.]+[.]?[0-9]*', '', row).rstrip()
     return f"{row_noF} F{feed_mm_min:.1f}\n"
 
+
 def extract_feedrate(row):
     m = re.search(r'F([0-9.]+)', row)
-    if not m: return None
-    try: return float(m.group(1))
-    except ValueError: return None
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
 
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Core: backtransform_data using HEIGHTMAP Δz(x,y)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def backtransform_data(
     data,
@@ -333,7 +406,7 @@ def backtransform_data(
     """
     Convert deformed-space G-code 'data' into final printer-space toolpaths.
     - Rewrites Z as Z := Z - Δz(x,y) using the provided heightmap field.
-    - Segments long XY moves.
+    - Segments long XY moves (unless maximal_length is huge, e.g. for test_2.gcode).
     - Perimeter slowdown on downward-facing geometry.
     """
     new_data = []
@@ -380,7 +453,7 @@ def backtransform_data(
             new_data.append(row)
             continue
 
-        # Move line (G0/G1 ...)
+        # Move line (G0/G1 ... )
         x_match = re.search(pattern_X, row)
         y_match = re.search(pattern_Y, row)
         z_match = re.search(pattern_Z, row)
@@ -405,7 +478,10 @@ def backtransform_data(
 
         # Segment long XY moves
         dist_xy = np.linalg.norm([x_new - x_old, y_new - y_old])
-        num_segm = max(int(dist_xy // maximal_length + 1), 1)
+        if maximal_length <= 0:
+            num_segm = 1
+        else:
+            num_segm = max(int(dist_xy // maximal_length + 1), 1)
 
         x_vals = np.linspace(x_old, x_new, num_segm + 1)
         y_vals = np.linspace(y_old, y_new, num_segm + 1)
@@ -500,9 +576,110 @@ def backtransform_data(
 
     return new_data
 
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Pre-segmentation of G-code moves (ONLY for test_2.gcode)
+# ---------------------------------------------------------------------------
+
+def pre_subdivide_gcode_moves(data, max_seg_len=0.15):
+    """
+    Pre-subdivide XY moves in raw slicer G-code BEFORE applying reverse deformation.
+
+    This is used ONLY for test/gcode_parts/test_2.gcode.
+
+    Assumes RELATIVE extrusion (M83): each motion line's E value is an increment.
+    That increment is split evenly across subsegments.
+    """
+
+    out = []
+
+    pat_cmd = re.compile(r'^(G0|G1)\s')
+    patX = re.compile(r'X([-0-9.]+)')
+    patY = re.compile(r'Y([-0-9.]+)')
+    patE = re.compile(r'E([-0-9.]+)')
+
+    x_old = None
+    y_old = None
+
+    for row in data:
+        stripped = row.strip()
+
+        # Pass non G0/G1 lines unchanged
+        if not pat_cmd.match(stripped):
+            out.append(row)
+            continue
+
+        mX = patX.search(row)
+        mY = patY.search(row)
+        mE = patE.search(row)
+
+        # If no XY on this line, keep as-is
+        if mX is None and mY is None:
+            out.append(row)
+            continue
+
+        x_new = x_old if mX is None and x_old is not None else (float(mX.group(1)) if mX is not None else None)
+        y_new = y_old if mY is None and y_old is not None else (float(mY.group(1)) if mY is not None else None)
+
+        # First XY occurrence: just record and pass through
+        if x_old is None or y_old is None or x_new is None or y_new is None:
+            out.append(row)
+            x_old = x_new
+            y_old = y_new
+            continue
+
+        dist = math.hypot(x_new - x_old, y_new - y_old)
+
+        # No subdivision needed
+        if dist <= max_seg_len or max_seg_len <= 0:
+            out.append(row)
+            x_old = x_new
+            y_old = y_new
+            continue
+
+        # Need subdivision
+        N = int(math.ceil(dist / max_seg_len))
+        xs = np.linspace(x_old, x_new, N + 1)
+        ys = np.linspace(y_old, y_new, N + 1)
+
+        e_total = float(mE.group(1)) if mE is not None else None
+        e_per = (e_total / N) if e_total is not None else None
+
+        for i in range(1, N + 1):
+            xi = xs[i]
+            yi = ys[i]
+            new_line = row
+
+            # Replace X/Y
+            if mX is not None:
+                new_line = patX.sub(f"X{xi:.3f}", new_line)
+            else:
+                new_line = new_line.rstrip() + f" X{xi:.3f}"
+
+            if mY is not None:
+                new_line = patY.sub(f"Y{yi:.3f}", new_line)
+            else:
+                new_line = new_line.rstrip() + f" Y{yi:.3f}"
+
+            # Split extrusion
+            if mE is not None and e_per is not None:
+                new_line = patE.sub(f"E{e_per:.5f}", new_line)
+
+            if not new_line.endswith("\n"):
+                new_line = new_line + "\n"
+
+            out.append(new_line)
+
+        x_old = x_new
+        y_old = y_new
+
+    print(f"[pre_subdivide_gcode_moves] Finished. Output lines: {len(out)}")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public entry: transformGCode (HEIGHTMAP version)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def transformGCode(
     in_file: str,
@@ -531,13 +708,24 @@ def transformGCode(
     out_dir            : output directory for final G-code
     surface_for_slowdown : FINAL geometry STL for downward-facing slowdown detection
 
-    Keep 'maximal_length', slowdown, and z_min clamp behavior consistent with your pipeline.
+    For most files: original stable behavior.
+    For test/gcode_parts/test_2.gcode:
+        - pre-segmentation before reverse mapping
+        - internal segmentation disabled by setting maximal_length huge.
     """
     start = time.time()
 
     # 1) Read deformed-space G-code
     with open(in_file, 'r', encoding='utf-8', errors='ignore') as f_gcode:
         data = f_gcode.readlines()
+
+    # 1b) Optional pre-segmentation ONLY for test_2.gcode
+    use_preseg = _should_presegment_test2(in_file)
+    if use_preseg:
+        data = pre_subdivide_gcode_moves(data, max_seg_len=PRESEG_MAX_LEN)
+        internal_max_length = 1e9  # effectively disable further segmentation
+    else:
+        internal_max_length = maximal_length
 
     # 2) Build Δz field from ORIGINAL STL with the SAME params used in heightmap_gen.py
     xmin, ymin, dx, dy, dist_out, supported, s, blend = build_heightmap_field(
@@ -552,7 +740,7 @@ def transformGCode(
     data_bt = backtransform_data(
         data=data,
         zmin_clamp=z_desired + 0.2,   # same clamp convention as before
-        maximal_length=maximal_length,
+        maximal_length=internal_max_length,
         xmin=xmin, ymin=ymin, dx=dx, dy=dy,
         dist_out=dist_out, supported=supported, s=s, blend=blend,
         tri_grid=tri_grid, cell_size=cell_size,
