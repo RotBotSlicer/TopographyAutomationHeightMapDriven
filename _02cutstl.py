@@ -11,20 +11,61 @@ from _10config import get_slic3r_binary, CUT_CONFIG
 def _read_cut_heights(cuts_file):
     """
     Read cut heights from cuts.txt → sorted list of floats.
-    Ignores anything <= ignore_min (usually 0 mm).
+
+    Supports:
+      - OLD format: one Z per line
+            20.0
+            30.0
+            37.641
+            45.3
+            60.0
+
+      - NEW format: three columns
+            index  flag  z_value/TOP
+            1 0 20.0000
+            2 1 30.0000
+            3 0 37.6410
+            4 1 45.3000
+            5 1 TOP
+
+    Ignores:
+      - anything <= ignore_min (usually 0 mm)
+      - lines with 'TOP' as Z
     """
     ignore_min = CUT_CONFIG.get("ignore_cuts_at_or_below_mm", 0.0)
 
     heights = []
     with open(cuts_file, "r") as f:
         for line in f:
-            line = line.strip().replace(",", ".")
+            line = line.strip()
             if not line:
                 continue
+
+            # Replace comma decimal separator if any
+            line = line.replace(",", ".")
+            tokens = line.split()
+
+            # Decide which token is the Z component
+            z_token = None
+            if len(tokens) >= 3:
+                # New 3-column format: idx, flag, z_value/TOP
+                z_token = tokens[2]
+            elif len(tokens) >= 1:
+                # Old format: single Z per line (or similar)
+                z_token = tokens[-1]
+
+            if z_token is None:
+                continue
+
+            if z_token.upper() == "TOP":
+                # TOP is always the final model height, not a cut plane
+                continue
+
             try:
-                val = float(line)
+                val = float(z_token)
             except ValueError:
                 continue
+
             if val > ignore_min:
                 heights.append(val)
 
@@ -41,6 +82,10 @@ def cutSTL(in_stl, cuts_file, out_folder):
       • NEVER cut too close to top (min_top_gap_mm)
       • Use safety offset (cut slightly LOWER inside geometry)
       • Works for ANY model height or shape
+
+    Cut heights are read from cuts_file. In the NEW pipeline, this file
+    is typically a 3-column cuts.txt, but legacy one-column formats are
+    still supported.
     """
 
     print("[cutSTL] Loading STL:", in_stl)
@@ -57,7 +102,7 @@ def cutSTL(in_stl, cuts_file, out_folder):
 
     # --- Read cut heights ---
     raw = _read_cut_heights(cuts_file)
-    print("  Raw cut heights:", raw)
+    print("  Raw cut heights from cuts.txt (after ignore_min):", raw)
 
     # ---------------------------------------------------------
     # RULES FOR INTERIOR CUT SELECTION

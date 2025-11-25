@@ -1,6 +1,7 @@
-# _01analysestl.py — Clean Version (Automatic Cuts + Overhang Detection)
+# _01analysestl.py — Clean Version (Automatic Cuts + Overhang Detection + 3-column cuts.txt)
 import numpy as np
 from stl import mesh
+from _10config import CUT_CONFIG
 
 
 # --------------------------------------------------------------------
@@ -24,12 +25,12 @@ def _triangle_normals(vectors):
 
 
 # --------------------------------------------------------------------
-#  AUTOMATIC CUT HEIGHTS
+#  AUTOMATIC CUT HEIGHTS (candidate planes)
 # --------------------------------------------------------------------
 
 def compute_cut_heights(stl_path, dz_min=6.0):
     """
-    Automatically compute vertical cut heights.
+    Automatically compute vertical cut heights (candidate planes).
 
     Parameters
     ----------
@@ -42,8 +43,9 @@ def compute_cut_heights(stl_path, dz_min=6.0):
     Returns
     -------
     list of floats
-        Sorted Z-values at which to cut the STL.
-        Always includes z=0.
+        Sorted Z-values (including z=0 and z_max) that define
+        natural candidate layers. These are later filtered into
+        interior cuts for actual segmentation.
     """
     body = mesh.Mesh.from_file(stl_path)
     verts = body.vectors.reshape(-1, 3)
@@ -51,8 +53,8 @@ def compute_cut_heights(stl_path, dz_min=6.0):
     z_values = verts[:, 2]
     z_min, z_max = float(np.min(z_values)), float(np.max(z_values))
 
-    # We detect natural changes in silhouette / shape
-    # by checking triangle normal changes vs Z.
+    # Detect natural changes in silhouette / shape by checking
+    # triangle normal changes vs Z.
     vectors = body.vectors
     normals = _triangle_normals(vectors)
 
@@ -63,8 +65,8 @@ def compute_cut_heights(stl_path, dz_min=6.0):
 
     flat_triangle_z = np.mean(vectors[is_flat, :, 2], axis=1) if np.any(is_flat) else []
 
-    # Combine: natural flat regions + min/max
-    raw_cuts = [0.0]   # MUST include zero
+    # Combine: natural flat regions + min/max + base at 0.0
+    raw_cuts = [0.0]   # MUST include zero as a reference
     raw_cuts.extend(flat_triangle_z)
     raw_cuts.extend([z_min, z_max])
 
@@ -84,48 +86,161 @@ def compute_cut_heights(stl_path, dz_min=6.0):
 
 
 # --------------------------------------------------------------------
-#  WRITE CUTS TO FILE
+#  INTERNAL: SEGMENT BOUNDS + TRANSFORM FLAGS
 # --------------------------------------------------------------------
 
-def analyseSTL(stl_path, cuts_txt_path):
+def _compute_segment_bounds_and_flags(stl_path, dz_min=6.0, angle_deg=45.0):
     """
-    Analyse STL → determine cut heights → write to cuts.txt
+    Compute vertical segments [z_low, z_high] and a transform flag per segment.
+
+    - Uses compute_cut_heights() to get candidate planes.
+    - Uses CUT_CONFIG to mimic the same "interior cut" logic as cutSTL:
+        * ignore_cuts_at_or_below_mm
+        * min_top_gap_mm
+    - Each segment gets a flag:
+        1 => heightmap-transform this segment
+        0 => keep planar
+
+    Additional rules:
+        - If there are >=2 segments:
+            * bottom segment flag = 0 (planar)
+            * top segment flag   = 1 (transformed)
+        - If there is only 1 segment:
+            * flag is based solely on overhang detection
+              (single-part behaviour same as old pipeline).
+    """
+    body = mesh.Mesh.from_file(stl_path)
+    vectors = body.vectors
+    verts = vectors.reshape(-1, 3)
+    z_values = verts[:, 2]
+    z_min, z_max = float(np.min(z_values)), float(np.max(z_values))
+
+    if z_max <= z_min:
+        # Degenerate case — treat as a single flat segment, planar by default.
+        return [(z_min, z_max)], [0]
+
+    # Candidate cuts from geometry (includes 0 and z_max)
+    candidate_cuts = compute_cut_heights(stl_path, dz_min=dz_min)
+    candidate_cuts = sorted(candidate_cuts)
+
+    # Mimic _02cutstl.py logic for which cuts become interior planes
+    ignore_min = CUT_CONFIG.get("ignore_cuts_at_or_below_mm", 0.0)
+    min_top_gap = CUT_CONFIG.get("min_top_gap_mm", 2.0)
+
+    # First emulate _read_cut_heights behaviour
+    raw = []
+    for z in candidate_cuts:
+        if z <= ignore_min:
+            continue
+        raw.append(float(z))
+
+    # Interior cuts (actual planes we will cut at)
+    interior_cuts = [
+        z for z in raw
+        if (z > z_min + 1e-6) and (z < (z_max - min_top_gap))
+    ]
+    interior_cuts = sorted(list(set(interior_cuts)))
+
+    # Build segment bounds: [z_min → first_cut], [cut_i → cut_{i+1}], ..., [last_cut → z_max]
+    segment_bounds = []
+    lower = z_min
+    for zc in interior_cuts:
+        segment_bounds.append((lower, zc))
+        lower = zc
+    segment_bounds.append((lower, z_max))  # top segment
+
+    # Precompute triangle normals and z-extent
+    normals = _triangle_normals(vectors)
+    tri_z = vectors[:, :, 2]
+    tri_z_min = tri_z.min(axis=1)
+    tri_z_max = tri_z.max(axis=1)
+
+    flags = []
+    for (low, high) in segment_bounds:
+        # Triangles that intersect [low, high]
+        mask = ~((tri_z_max < low) | (tri_z_min > high))
+        if not np.any(mask):
+            # No triangles in this band → treat as planar
+            flags.append(0)
+            continue
+
+        seg_normals = normals[mask]
+        dot_up = seg_normals[:, 2]
+        angle = np.degrees(np.arccos(np.clip(dot_up, -1.0, 1.0)))
+
+        overhang_mask = angle > angle_deg
+        flag = 1 if np.any(overhang_mask) else 0
+        flags.append(flag)
+
+    # Apply bottom/top overrides only when there are multiple segments
+    if len(flags) >= 2:
+        # Bottom segment → forced planar
+        flags[0] = 0
+        # Top segment → forced transform
+        flags[-1] = 1
+
+    return segment_bounds, flags
+
+
+# --------------------------------------------------------------------
+#  WRITE 3-COLUMN CUTS TO FILE
+# --------------------------------------------------------------------
+
+def analyseSTL(stl_path, cuts_txt_path, dz_min=6.0, angle_deg=45.0):
+    """
+    Analyse STL → determine segment bounds + transform flags → write 3-column cuts.txt
+
+    Output format (per line):
+        index  transform_flag  z_value
+    for all segments except the last, and:
+        index  transform_flag  TOP
+    for the topmost segment.
+
+    Example:
+        1 0 20.0000
+        2 1 30.0000
+        3 0 37.6410
+        4 1 45.3000
+        5 1 TOP
     """
     print("  [analyseSTL] Loading:", stl_path)
-    cuts = compute_cut_heights(stl_path, dz_min=6.0)
+    segment_bounds, flags = _compute_segment_bounds_and_flags(
+        stl_path, dz_min=dz_min, angle_deg=angle_deg
+    )
 
     with open(cuts_txt_path, "w") as f:
-        for z in cuts:
-            f.write(f"{z:.6f}\n")
+        for idx, ((low, high), flag) in enumerate(zip(segment_bounds, flags), start=1):
+            if idx == len(segment_bounds):
+                # Topmost segment → write TOP
+                f.write(f"{idx} {int(flag)} TOP\n")
+            else:
+                # Non-top segments → write upper boundary as the cut Z-value
+                f.write(f"{idx} {int(flag)} {high:.6f}\n")
 
-    print("  [analyseSTL] Computed cut heights:", cuts)
-    print("  [analyseSTL] Saved to:", cuts_txt_path)
+    print("  [analyseSTL] Segments (low → high, flag):")
+    for idx, ((low, high), flag) in enumerate(zip(segment_bounds, flags), start=1):
+        col3 = "TOP" if idx == len(segment_bounds) else f"{high:.6f}"
+        print(
+            f"    {idx}: flag={int(flag)}  "
+            f"range=[{low:.6f}, {high:.6f}]  → cuts.txt col3={col3}"
+        )
+
+    print("  [analyseSTL] Saved 3-column cuts file to:", cuts_txt_path)
 
 
 # --------------------------------------------------------------------
-#  SEGMENT OVERHANG DETECTION
+#  LEGACY SEGMENT OVERHANG DETECTION (fallback use)
 # --------------------------------------------------------------------
 
 def segment_has_overhang(stl_path, angle_deg=45.0):
     """
-    Determine if a segmented STL contains ANY downward-facing triangles.
+    Determine if an STL contains ANY downward-facing triangles.
 
     Overhang rule:
         If the angle between triangle normal and +Z is > angle_deg,
         the part is considered “nonplanar” or “needs deformation”.
 
-    Parameters
-    ----------
-    stl_path : str
-        Path to a segment STL (from stl_parts/)
-    angle_deg : float
-        Threshold angle. 45° is a good universal default.
-
-    Returns
-    -------
-    bool
-        True  → this segment should be heightmap-transformed
-        False → this segment can remain planar
+    This is kept for backwards compatibility / fallback logic.
     """
     body = mesh.Mesh.from_file(stl_path)
     normals = _triangle_normals(body.vectors)
@@ -134,10 +249,7 @@ def segment_has_overhang(stl_path, angle_deg=45.0):
     dot_up = normals[:, 2]
 
     # Angle between normal and +Z
-    # angle = arccos(dot_up)
     angle = np.arccos(np.clip(dot_up, -1.0, 1.0)) * 180.0 / np.pi
 
-    # Downward & overhang if angle > angle_deg
     overhang_mask = angle > angle_deg
-
     return bool(np.any(overhang_mask))

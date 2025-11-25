@@ -1,5 +1,4 @@
-# _00all.py  — Clean, audited pipeline (heightmap nonplanar, planar base)
-
+# _00all.py  — Clean, audited pipeline (heightmap nonplanar, planar base, 3-column cuts.txt)
 import sys
 import os
 import time
@@ -38,7 +37,8 @@ def purge_heightmaps():
         shutil.rmtree(heightmap_dir)
     os.makedirs(heightmap_dir, exist_ok=True)
     print("[PIPELINE] Fresh heightmaps/ ready.")
-    
+
+
 def _clear_folder(path):
     """
     Remove all files in a folder.
@@ -58,6 +58,47 @@ def createFoldersIfMissing(folder_dict: dict):
     """
     for path in folder_dict.values():
         os.makedirs(path, exist_ok=True)
+
+
+def _load_transform_flags(cuts_txt_path):
+    """
+    Parse cuts.txt (3-column format) and extract per-segment transform flags.
+
+    Expected NEW format:
+        index  flag  z_value/TOP
+
+    Returns
+    -------
+    list[int] or None
+        flags[i] corresponds to segment i (0-based indexing).
+        If no valid flags are found (e.g., legacy 1-column cuts.txt),
+        returns None so the pipeline falls back to geometric overhang detection.
+    """
+    if not os.path.isfile(cuts_txt_path):
+        return None
+
+    flags = []
+    has_flags = False
+
+    with open(cuts_txt_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            tokens = line.split()
+            if len(tokens) < 3:
+                # Likely legacy format, ignore for flags
+                continue
+            # tokens: [index, flag, z_or_TOP]
+            flag_str = tokens[1]
+            try:
+                flag = int(flag_str)
+            except ValueError:
+                continue
+            flags.append(flag)
+            has_flags = True
+
+    return flags if has_flags else None
 
 
 # --------------------------------------------------------------------------
@@ -111,12 +152,20 @@ def _backtransform_and_slowdown(
 #  SLICE + (OPTIONALLY) TRANSFORM ONE SEGMENT
 # --------------------------------------------------------------------------
 
-def sliceTransform(folder: dict, filename: str, bottom: bool = False, top: bool = False):
+def sliceTransform(
+    folder: dict,
+    filename: str,
+    bottom: bool = False,
+    top: bool = False,
+    transform_flag=None,
+):
     """
     Process one segmented STL from stl_parts/:
 
       1. Copy a coarse original (unrefined) mesh to stl_coarse/
-      2. Detect overhangs on that segment
+      2. Determine whether this segment is NONPLANAR based on:
+           - transform_flag from cuts.txt (if provided), OR
+           - fallback to geometric overhang detection.
       3. If NONPLANAR (and NOT forced planar bottom) →
            refine + heightmap deform + slice + backtransform
       4. Else → planar slice only (no deformation)
@@ -143,17 +192,30 @@ def sliceTransform(folder: dict, filename: str, bottom: bool = False, top: bool 
         shutil.copyfile(stl_part, stl_coarse)
         print(f"  [sliceTransform] Saved coarse copy → {stl_coarse}")
 
-    # 2) Overhang detection for this SEGMENT
-    has_overhang = segment_has_overhang(stl_part)
-    print(f"  [sliceTransform] segment_has_overhang({filename}) = {has_overhang}")
+    # 2) Decide NONPLANAR FLAG for this SEGMENT
+    if transform_flag is None:
+        # Fallback: compute from geometry (legacy behaviour)
+        has_overhang = segment_has_overhang(stl_part)
+        print(
+            f"  [sliceTransform] segment_has_overhang({filename}) "
+            f"(fallback) = {has_overhang}"
+        )
+    else:
+        has_overhang = bool(transform_flag)
+        print(
+            f"  [sliceTransform] Using transform_flag from cuts.txt "
+            f"for {filename} → {has_overhang} (flag={transform_flag})"
+        )
 
     # 3) BOTTOM OVERRIDE — ONLY if this is a TRUE bottom (multi-part)
     #    If a model has only one segment (bottom=True & top=True),
     #    we DO NOT override; it may be deformed & reverse-transformed.
     if bottom and not top:
         if has_overhang:
-            print("  [sliceTransform] BOTTOM OVERRIDE: segment has overhangs "
-                  "but is forced planar to keep a stable base.")
+            print(
+                "  [sliceTransform] BOTTOM OVERRIDE: segment has overhangs "
+                "but is forced planar to keep a stable base."
+            )
         has_overhang = False
 
     # 4) NONPLANAR PATH  (overhanging AND not forced planar)
@@ -220,10 +282,14 @@ def sliceTransform(folder: dict, filename: str, bottom: bool = False, top: bool 
 #  SLICE ALL SEGMENTS
 # --------------------------------------------------------------------------
 
-def sliceAll(folder: dict):
+def sliceAll(folder: dict, segment_flags=None):
     """
     Walk through stl_parts/ in sorted order and process each segment.
     The first segment is 'bottom', the last is 'top'.
+
+    If segment_flags is provided (list of 0/1), it is used to decide
+    which segments are transformed. Otherwise, the pipeline falls back
+    to geometric overhang detection.
     """
 
     parts = [
@@ -239,8 +305,20 @@ def sliceAll(folder: dict):
     for idx, fname in enumerate(parts):
         bottom = (idx == 0)
         top    = (idx == len(parts) - 1)
-        print(f"\n=== Processing {fname}  | bottom={bottom} | top={top} ===")
-        sliceTransform(folder, fname, bottom=bottom, top=top)
+
+        # Map flag list (0/1) to this segment index
+        flag = None
+        if segment_flags is not None and idx < len(segment_flags):
+            flag = segment_flags[idx]
+
+        print(f"\n=== Processing {fname}  | bottom={bottom} | top={top} | flag={flag} ===")
+        sliceTransform(
+            folder,
+            fname,
+            bottom=bottom,
+            top=top,
+            transform_flag=flag,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -265,9 +343,15 @@ def main(input_stl: str):
     cuts_txt    = os.path.join(folders["root"], "cuts.txt")
     working_stl = os.path.join(folders["root"], base + ".stl")
 
-    # 1. Analyse STL → ALWAYS recompute cut heights
-    print("\n=== Analysing STL for cut heights (always recompute) ===")
-    analyseSTL(input_stl, cuts_txt)
+    cuts_already_exists = os.path.exists(cuts_txt)
+
+    # 1. Analyse STL → only if cuts.txt does NOT already exist
+    if cuts_already_exists:
+        print("\n=== Using existing cuts.txt (skipping automatic analysis) ===")
+        print("    cuts.txt:", cuts_txt)
+    else:
+        print("\n=== Analysing STL for cut heights & transform flags ===")
+        analyseSTL(input_stl, cuts_txt)
 
     # 2. Copy STL into working directory (so we can safely mutate it in cutSTL)
     if PIPELINE_CONFIG.get("copy_input_to_work", True):
@@ -281,9 +365,17 @@ def main(input_stl: str):
     print("\n=== Cutting STL into parts ===")
     cutSTL(stl_for_cut, cuts_txt, folders["stl_parts"])
 
+    # Load transform flags from cuts.txt (if present in 3-column form)
+    segment_flags = _load_transform_flags(cuts_txt)
+    if segment_flags is not None:
+        print("[main] Loaded transform flags from cuts.txt:", segment_flags)
+    else:
+        print("[main] No valid transform flags found in cuts.txt → "
+              "falling back to geometric overhang detection.")
+
     # 4. Slice + (if needed) deform segments
     print("\n=== Slicing all parts ===")
-    sliceAll(folders)
+    sliceAll(folders, segment_flags=segment_flags)
 
     # 5. Combine per-part G-code
     combined_path = os.path.join(folders["root"], base + ".gcode")

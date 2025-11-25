@@ -59,7 +59,7 @@ def _should_presegment(in_file: str) -> bool:
     for tail in TARGET_TAILS:
         if norm_path.endswith(tail):
             print(f"[transformGCode] Pre-segmentation ENABLED for {tail}")
-            return True
+            return False
 
     print("[transformGCode] Pre-segmentation DISABLED for this file.")
     return False
