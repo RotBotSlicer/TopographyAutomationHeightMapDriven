@@ -35,7 +35,7 @@ from scipy.ndimage import distance_transform_edt as edt
 # Max segment length (XY) for pre-segmentation of test_4.gcode.
 # This only affects test/gcode_parts/test_4.gcode.
 PRESEG_MAX_LEN = 0.25
-
+SEGMENT_TOGGLE = True
 
 def _should_presegment(in_file: str) -> bool:
     """
@@ -59,7 +59,7 @@ def _should_presegment(in_file: str) -> bool:
     for tail in TARGET_TAILS:
         if norm_path.endswith(tail):
             print(f"[transformGCode] Pre-segmentation ENABLED for {tail}")
-            return False
+            return SEGMENT_TOGGLE
 
     print("[transformGCode] Pre-segmentation DISABLED for this file.")
     return False
