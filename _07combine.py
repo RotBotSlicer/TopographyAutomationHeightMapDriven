@@ -1,17 +1,15 @@
-# _07combine.py  (FINAL — collision-safe, no-seam-extrusion version)
+# _07combine.py  (segment-local safe seam travel)
 import os
 
-# ---------------------------------------------------------------------
-# INTERNAL HELPERS
-# ---------------------------------------------------------------------
+DEFAULT_TRAVEL_FEEDRATE = 6000.0   # fallback if nothing else is found
+
+
+# --------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------
 
 def _find_payload_start_index(lines):
-    """
-    Find where real printing begins in a G-code file.
-    We look for the first ';TYPE:' except ';TYPE:Custom'.
-    If none, fall back safely.
-    """
-
+    """Find index of first real printing ';TYPE:' line."""
     type_all = []
     type_non_custom = []
 
@@ -23,71 +21,114 @@ def _find_payload_start_index(lines):
 
     if type_non_custom:
         return type_non_custom[0]
-
     if type_all:
         return type_all[0]
-
     return 0
 
 
 def _extract_print_payload(lines, is_first_file, context_lines_before_type=2):
-    """
-    For the first file -> return whole G-code (keep headers).
-    For later files   -> strip headers and return only the print moves.
-
-    We begin a little BEFORE the first ';TYPE:' line to keep necessary Z/E setup.
-    """
-
+    """For first file → keep all. For others → strip headers around first ';TYPE:'."""
     if is_first_file:
-        return lines[:]  # keep full file
+        return lines[:]
 
-    type_idx = _find_payload_start_index(lines)
-
-    # keep some lines before first type block for correct Z/E state
-    start_idx = max(type_idx - context_lines_before_type, 0)
-
+    t = _find_payload_start_index(lines)
+    start_idx = max(t - context_lines_before_type, 0)
     return lines[start_idx:]
 
 
-def _patch_first_movement(payload):
+def _parse_F_from_line(line):
+    parts = line.strip().split()
+    for p in parts:
+        if p.startswith("F"):
+            try:
+                return float(p[1:])
+            except Exception:
+                pass
+    return None
+
+
+def _is_feedrate_only_move(line):
+    """Identify lines like: 'G1 F7200' or 'G0 F9000' — no XYZE."""
+    stripped = line.strip()
+    if not stripped.startswith(("G0", "G1")):
+        return False
+    parts = stripped.split()
+    saw_F = False
+    for p in parts[1:]:
+        if p.startswith("F"):
+            saw_F = True
+        elif p.startswith(("X", "Y", "Z", "E")):
+            return False   # has movement or extrusion → not feedrate-only
+    return saw_F
+
+
+def _find_first_internal_feedrate(lines):
     """
-    IMPORTANT FIX:
-    Ensure the FIRST XY movement of this appended segment is a *travel move*
-    (G0 without extrusion), even if slicer emits:
-        G1 X… Y… Z… E0.0021  <-- (bad)
-    We convert it to:
-        G0 X… Y… Z…          <-- (good)
+    Find the first feedrate *inside this segment itself* (ignoring comments).
+    This is what we want to use for the seam travel of this segment.
+    """
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(";"):
+            continue
+        f = _parse_F_from_line(line)
+        if f is not None:
+            return f
+    return None
+
+
+def _patch_first_movement(payload, travel_feedrate):
+    """
+    Patch one segment's payload:
+
+      ✔ Removes all E-only lines before first XY
+      ✔ Removes all feedrate-only lines before first XY
+      ✔ Converts first XY to:
+            G0 X.. Y.. Z.. F<travel_feedrate>
     """
 
     patched = []
-    first_move_fixed = False
+    first_xy_fixed = False
+
+    travel_F = travel_feedrate if travel_feedrate is not None else DEFAULT_TRAVEL_FEEDRATE
 
     for line in payload:
         stripped = line.strip()
 
-        # Detect XY movement line
-        if (not first_move_fixed and
-            (stripped.startswith(("G1", "G0"))) and
-            ("X" in stripped or "Y" in stripped)):
-
-            # Build clean G0 travel move WITHOUT extrusion
-            parts = stripped.split()
-            new_parts = ["G0"]  # travel only
-
-            for p in parts[1:]:
-                # keep X,Y,Z,F — drop E
-                if p.startswith(("X", "Y", "Z", "F")):
-                    new_parts.append(p)
-
-            patched.append(" ".join(new_parts) + "\n")
-            first_move_fixed = True
+        # keep comments as-is
+        if stripped.startswith(";"):
+            patched.append(line)
             continue
 
-        # Remove any early pure extrusion (E-only) before first XY move
-        if (not first_move_fixed and
-            (" E" in stripped) and
-            ("X" not in stripped and "Y" not in stripped)):
-            # skip this E-only command
+        # RULE 1: DELETE E-only commands BEFORE first XY
+        if (not first_xy_fixed and
+            ("E" in stripped) and
+            ("X" not in stripped) and
+            ("Y" not in stripped)):
+            continue
+
+        # RULE 2: DELETE feedrate-only moves BEFORE first XY
+        if (not first_xy_fixed and _is_feedrate_only_move(line)):
+            continue
+
+        # RULE 3: FIRST XY MOVEMENT — rewrite to G0 travel with controlled F
+        if (not first_xy_fixed and
+            stripped.startswith(("G1", "G0")) and
+            ("X" in stripped or "Y" in stripped)):
+
+            parts = stripped.split()
+            new_parts = ["G0"]   # enforce travel
+
+            for p in parts[1:]:
+                if p.startswith(("X", "Y", "Z")):
+                    new_parts.append(p)
+                # drop any E
+                elif p.startswith("E"):
+                    continue
+
+            new_parts.append(f"F{travel_F:.0f}")
+            patched.append(" ".join(new_parts) + "\n")
+            first_xy_fixed = True
             continue
 
         patched.append(line)
@@ -95,19 +136,21 @@ def _patch_first_movement(payload):
     return patched
 
 
-# ---------------------------------------------------------------------
-# MAIN COMBINER
-# ---------------------------------------------------------------------
+# --------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------
 
 def combineGCode(in_folder, out_file, context_lines_before_type=2):
     """
-    Safely combine multiple part G-code files:
-      ✔ Keep full header from the FIRST file
-      ✔ Strip headers from all later files
-      ✔ Patch first movement of each segment to avoid:
-            - nozzle collisions
-            - extrusion across seam plane
-      ✔ Add helpful segment headers for debugging
+    Segment-local safe combiner:
+
+      ✔ keep full header from first file
+      ✔ strip headers from remaining files
+      ✔ detect payload start correctly
+      ✔ for each later segment:
+          - use that segment's own first F (e.g. 1200 / 1800) as seam travel speed
+          - if none exists, fall back to last global F, else DEFAULT_TRAVEL_FEEDRATE
+      ✔ remove rogue F-only and E-only lines before first XY
     """
 
     in_folder_abs = os.path.abspath(in_folder)
@@ -116,14 +159,14 @@ def combineGCode(in_folder, out_file, context_lines_before_type=2):
     print("[combineGCode] Combining from:", in_folder_abs)
     print("[combineGCode] Output:", out_file_abs)
 
-    # Find all .gcode files
     gcode_files = [
         f for f in os.listdir(in_folder_abs)
         if f.lower().endswith(".gcode") and not f.startswith(".")
     ]
     gcode_files.sort()
-
     print("[combineGCode] Order:", gcode_files)
+
+    last_feedrate = None   # global modal feedrate across segments
 
     with open(out_file_abs, "w", newline="\n") as fout:
         for idx, fname in enumerate(gcode_files):
@@ -133,21 +176,33 @@ def combineGCode(in_folder, out_file, context_lines_before_type=2):
             with open(full_path, "r") as fin:
                 lines = fin.readlines()
 
-            # Strip headers from non-first files
+            # Raw payload for this file (still unpatched)
             payload = _extract_print_payload(
                 lines,
                 is_first_file=(idx == 0),
                 context_lines_before_type=context_lines_before_type,
             )
 
-            # FIX: Patch first XY movement for all but first file
+            # For non-first segments, patch the first XY move
             if idx > 0:
-                payload = _patch_first_movement(payload)
+                # Segment-local preferred feedrate (e.g. the G1 F1200 inside test_2)
+                local_feed = _find_first_internal_feedrate(payload)
 
-            # Write combined output
+                # If the segment has its own F, use that. Otherwise fall back.
+                seam_travel_F = local_feed if local_feed is not None else last_feedrate
+
+                payload = _patch_first_movement(payload, seam_travel_F)
+
+            # Write combined output and keep tracking modal feedrate
             fout.write(f"; --- START OF SEGMENT {fname} ---\n")
+
             for line in payload:
                 fout.write(line)
+
+                fval = _parse_F_from_line(line)
+                if fval is not None:
+                    last_feedrate = fval
+
             fout.write(f"; --- END OF SEGMENT {fname} ---\n")
 
     print("[combineGCode] DONE:", out_file_abs)
